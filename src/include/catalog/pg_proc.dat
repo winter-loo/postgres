@@ -11349,6 +11349,14 @@
   prorettype => 'int8', proargtypes => 'internal any',
   proallargtypes => '{internal,any}', proargmodes => '{i,v}',
   prosrc => 'hypothetical_dense_rank_final' },
+{ oid => '19921', descr => 'keep first group of after dense rank',
+  proname => 'dense_rank_first', prokind => 'a',
+  proisstrict => 'f', prorettype => 'numeric', proargtypes => 'any',
+  prosrc => 'aggregate_dummy' },
+{ oid => '19922', descr => 'aggregate final function',
+  proname => 'dense_rank_first_final', proisstrict => 'f',
+  prorettype => 'numeric', proargtypes => 'internal any',
+  prosrc => 'dense_rank_keep_first' },
 
 # pg_upgrade support
 { oid => '3582', descr => 'for use by pg_upgrade',

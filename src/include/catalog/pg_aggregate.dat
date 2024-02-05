@@ -659,6 +659,10 @@
   aggtransfn => 'ordered_set_transition_multi',
   aggfinalfn => 'dense_rank_final', aggfinalextra => 't', aggfinalmodify => 'w',
   aggmfinalmodify => 'w', aggtranstype => 'internal' },
+{ aggfnoid => 'dense_rank_first(any)', aggkind => 'o', aggnumdirectargs => '1',
+  aggtransfn => 'ordered_set_transition_multi',
+  aggfinalfn => 'dense_rank_first_final', aggfinalmodify => 'w',
+  aggmfinalmodify => 'w', aggtranstype => 'internal' },
 
 # any_value
 { aggfnoid => 'any_value(anyelement)', aggtransfn => 'any_value_transfn',

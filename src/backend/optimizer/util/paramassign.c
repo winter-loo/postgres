@@ -245,14 +245,14 @@ replace_outer_agg(PlannerInfo *root, Aggref *agg)
 	pitem->item = (Node *) agg;
 	pitem->paramId = list_length(root->glob->paramExecTypes);
 	root->glob->paramExecTypes = lappend_oid(root->glob->paramExecTypes,
-											 agg->aggtype);
+											 agg->aggrestype);
 
 	root->plan_params = lappend(root->plan_params, pitem);
 
 	retval = makeNode(Param);
 	retval->paramkind = PARAM_EXEC;
 	retval->paramid = pitem->paramId;
-	retval->paramtype = agg->aggtype;
+	retval->paramtype = agg->aggrestype;
 	retval->paramtypmod = -1;
 	retval->paramcollid = agg->aggcollid;
 	retval->location = agg->location;

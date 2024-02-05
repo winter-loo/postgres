@@ -218,6 +218,52 @@ static void preprocess_pubobj_list(List *pubobjspec_list,
 								   core_yyscan_t yyscanner);
 static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
+/*
+#ifdef YYDEBUG
+#undef YYDEBUG
+#define YYDEBUG 1
+#endif
+int base_yydebug = 1;
+#define YYFPRINTF trace_parser
+#include <stdio.h>
+#include "utils/guc.h"
+void trace_parser(FILE* stderr, const char* fmt, ...) __attribute__((format (printf, 2, 3)));
+
+void trace_parser(FILE* stderr, const char* fmt, ...) {
+  StringInfoData buf;
+  va_list   ap;
+  int     needed;
+  char trace_file[1024];
+  FILE* trace_fd;
+
+  if (client_min_messages != LOG)
+  	return;
+
+  initStringInfo(&buf);
+  for (;;)
+  {
+    va_start(ap, fmt);
+    needed = appendStringInfoVA(&buf, fmt, ap);
+    va_end(ap);
+    if (needed == 0)
+      break;
+    enlargeStringInfo(&buf, needed);
+  }
+
+  strcpy(trace_file, getenv("HOME"));
+  strcat(trace_file, "/pgbison.trace");
+  trace_fd = fopen(trace_file, "a+");
+  if (!trace_fd)
+    elog(ERROR, "cannot open file %s", trace_file);
+
+  fwrite(buf.data, sizeof(char), buf.len, trace_fd);
+  fclose(trace_fd);
+
+  ereport(LOG, (errmsg_internal("'%s'", buf.data)));
+  pfree(buf.data);
+}
+*/
+
 %}
 
 %pure-parser
@@ -278,6 +324,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	MergeWhenClause *mergewhen;
 	struct KeyActions *keyactions;
 	struct KeyAction *keyaction;
+	DenseRank	*denserank;
 }
 
 %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
@@ -629,6 +676,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <with>	with_clause opt_with_clause
 %type <list>	cte_list
 
+%type <denserank> keep_clause
 %type <list>	within_group_clause
 %type <node>	filter_clause
 %type <list>	window_clause window_definition_list opt_partition_clause
@@ -703,7 +751,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
 
 	DATA_P DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS
-	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC
+	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DENSE_RANK DEPENDS DEPTH DESC
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
@@ -726,14 +774,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_OBJECT JSON_OBJECTAGG
 	JSON_SCALAR JSON_SERIALIZE
 
-	KEY KEYS
+	KEY KEYS KEEP_P
 
 	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
 
 	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE METHOD
-	MINUTE_P MINVALUE MODE MONTH_P MOVE
+	MIDDLE MINUTE_P MINVALUE MODE MONTH_P MOVE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NEW NEXT NFC NFD NFKC NFKD NO NONE
 	NORMALIZE NORMALIZED
@@ -793,8 +841,11 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * as NOT, at least with respect to their left-hand subexpression.
  * FORMAT_LA, NULLS_LA, WITH_LA, and WITHOUT_LA are needed to make the grammar
  * LALR(1).
+ * 
+ * KEEP_LA is needed to make the grammar LALR(1). Otherwise, shift/reduce conflict
+ * could occur when "keep" is identified as ColLabel.
  */
-%token		FORMAT_LA NOT_LA NULLS_LA WITH_LA WITHOUT_LA
+%token		FORMAT_LA NOT_LA NULLS_LA WITH_LA WITHOUT_LA KEEP_LA
 
 /*
  * The grammar likewise thinks these tokens are keywords, but they are never
@@ -15364,6 +15415,14 @@ func_expr: func_application within_group_clause filter_clause over_clause
 					n->over = $4;
 					$$ = (Node *) n;
 				}
+			| func_application keep_clause over_clause
+				{
+					FuncCall	*n = (FuncCall *) $1;
+					n->dense_rank = $2;
+					n->agg_order = $2->agg_order;
+					n->over = $3;
+					$$ = (Node *) n;
+				}
 			| json_aggregate_func filter_clause over_clause
 				{
 					JsonAggConstructor *n = IsA($1, JsonObjectAgg) ?
@@ -15882,6 +15941,27 @@ xml_passing_mech:
 within_group_clause:
 			WITHIN GROUP_P '(' sort_clause ')'		{ $$ = $4; }
 			| /*EMPTY*/								{ $$ = NIL; }
+		;
+
+keep_clause:
+			KEEP_LA '(' DENSE_RANK FIRST_P sort_clause ')'
+				{
+					$$ = makeNode(DenseRank);
+					$$->keep = DENSE_RANK_KEEP_FIRST;
+					$$->agg_order = $5;
+				}
+		|	KEEP_LA '(' DENSE_RANK LAST_P sort_clause ')'
+				{
+					$$ = makeNode(DenseRank);
+					$$->keep = DENSE_RANK_KEEP_LAST;
+					$$->agg_order = $5;
+				}
+		| 	KEEP_LA '(' DENSE_RANK MIDDLE sort_clause ')'
+				{
+					$$ = makeNode(DenseRank);
+					$$->keep = DENSE_RANK_KEEP_MIDDLE;
+					$$->agg_order = $5;
+				}
 		;
 
 filter_clause:
@@ -17200,6 +17280,7 @@ unreserved_keyword:
 			| DELETE_P
 			| DELIMITER
 			| DELIMITERS
+			| DENSE_RANK
 			| DEPENDS
 			| DEPTH
 			| DETACH
@@ -17266,6 +17347,7 @@ unreserved_keyword:
 			| ISOLATION
 			| KEY
 			| KEYS
+			| KEEP_P
 			| LABEL
 			| LANGUAGE
 			| LARGE_P
@@ -17286,6 +17368,7 @@ unreserved_keyword:
 			| MAXVALUE
 			| MERGE
 			| METHOD
+			| MIDDLE
 			| MINUTE_P
 			| MINVALUE
 			| MODE
@@ -17754,6 +17837,7 @@ bare_label_keyword:
 			| DELETE_P
 			| DELIMITER
 			| DELIMITERS
+			| DENSE_RANK
 			| DEPENDS
 			| DEPTH
 			| DESC
@@ -17849,6 +17933,7 @@ bare_label_keyword:
 			| JSON_SERIALIZE
 			| KEY
 			| KEYS
+			| KEEP_P
 			| LABEL
 			| LANGUAGE
 			| LARGE_P
@@ -17876,6 +17961,7 @@ bare_label_keyword:
 			| MAXVALUE
 			| MERGE
 			| METHOD
+			| MIDDLE
 			| MINVALUE
 			| MODE
 			| MOVE

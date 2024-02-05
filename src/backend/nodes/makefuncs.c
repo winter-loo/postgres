@@ -600,6 +600,7 @@ makeFuncCall(List *name, List *args, CoercionForm funcformat, int location)
 	n->func_variadic = false;
 	n->funcformat = funcformat;
 	n->location = location;
+	n->dense_rank = NULL;
 	return n;
 }
 

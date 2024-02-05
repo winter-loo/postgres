@@ -3758,7 +3758,7 @@ transformJsonAggConstructor(ParseState *pstate, JsonAggConstructor *agg_ctor,
 		Aggref	   *aggref = makeNode(Aggref);
 
 		aggref->aggfnoid = aggfnoid;
-		aggref->aggtype = aggtype;
+		aggref->aggrestype = aggtype;
 
 		/* aggcollid and inputcollid will be set by parse_collate.c */
 		/* aggtranstype will be set by planner */
