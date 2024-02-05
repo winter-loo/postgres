@@ -31,6 +31,8 @@
 #include "utils/memutils.h"
 #include "utils/memutils_internal.h"
 #include "utils/memutils_memorychunk.h"
+#include "utils/guc.h"
+#include <time.h> // time
 
 
 static void BogusFree(void *pointer);
@@ -1596,6 +1598,19 @@ repalloc_huge(void *pointer, Size size)
 {
 	/* this one seems not worth its own implementation */
 	return repalloc_extended(pointer, size, MCXT_ALLOC_HUGE);
+}
+
+void
+trace_memory_context(MemoryContext old, MemoryContext current, const char *file, int line)
+{
+	const char *old_name = old->name ? old->name : "()";
+	const char *current_name = current->name ? current->name : "()";
+
+	if (strcmp(current->name, ErrorContext->name) != 0 &&
+		strcmp(old->name, ErrorContext->name) != 0)
+	{
+		elog(DEBUG5, "[%s:%d] memory context switch to (%s) from (%s)", file, line, current_name, old_name);
+	}
 }
 
 /*

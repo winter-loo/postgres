@@ -120,12 +120,16 @@ extern pg_nodiscard void *repalloc_huge(void *pointer, Size size);
  */
 
 #ifndef FRONTEND
+#define MemoryContextSwitchTo(context)  MemoryContextSwitchToLog(context, __FILE__, __LINE__)
+extern void trace_memory_context(MemoryContext old, MemoryContext current, const char *file, int line);
+
 static inline MemoryContext
-MemoryContextSwitchTo(MemoryContext context)
+MemoryContextSwitchToLog(MemoryContext context, const char *file, int line)
 {
 	MemoryContext old = CurrentMemoryContext;
 
 	CurrentMemoryContext = context;
+	trace_memory_context(old, context, file, line);
 	return old;
 }
 #endif							/* FRONTEND */

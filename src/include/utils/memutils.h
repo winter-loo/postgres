@@ -107,12 +107,16 @@ extern void ProcessLogMemoryContextInterrupt(void);
  * Memory-context-type-specific functions
  */
 
+#define AllocSetContextCreateInternal(parent, name, minContextSize, initBlockSize, maxBlockSize) \
+	AllocSetContextCreateInternalLog(parent, name, minContextSize, initBlockSize, maxBlockSize, __FILE__, __LINE__)
+
 /* aset.c */
-extern MemoryContext AllocSetContextCreateInternal(MemoryContext parent,
-												   const char *name,
-												   Size minContextSize,
-												   Size initBlockSize,
-												   Size maxBlockSize);
+extern MemoryContext AllocSetContextCreateInternalLog(MemoryContext parent,
+													  const char *name,
+													  Size minContextSize,
+													  Size initBlockSize,
+													  Size maxBlockSize,
+													  const char *file, int line);
 
 /*
  * This wrapper macro exists to check for non-constant strings used as context
