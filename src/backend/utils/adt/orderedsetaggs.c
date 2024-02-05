@@ -16,17 +16,23 @@
 
 #include <math.h>
 
+#include "utils/datum.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
+#include "executor/execExpr.h"
+#include "executor/nodeAgg.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_agg.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplesort.h"
 
@@ -89,6 +95,9 @@ typedef struct OSAPerQueryState
 	bool		sortNullsFirst;
 	/* Equality operator call info, created only if needed: */
 	FmgrInfo	equalfn;
+
+	Oid			applyfnoid;
+	FmgrInfo	applyfn;
 } OSAPerQueryState;
 
 typedef struct OSAPerGroupState
@@ -144,7 +153,7 @@ ordered_set_startup(FunctionCallInfo fcinfo, bool use_tuples)
 		aggref = AggGetAggref(fcinfo);
 		if (!aggref)
 			elog(ERROR, "ordered-set aggregate called in non-aggregate context");
-		if (!AGGKIND_IS_ORDERED_SET(aggref->aggkind))
+		if (!AGGKIND_IS_ORDERED_SET(aggref->aggkind) && aggref->dr_keep == DENSE_RANK_KEEP_NONE)
 			elog(ERROR, "ordered-set aggregate support function called for non-ordered-set aggregate");
 
 		/*
@@ -1288,6 +1297,675 @@ hypothetical_cume_dist_final(PG_FUNCTION_ARGS)
 	result_val = (double) (rank) / (double) (rowcount + 1);
 
 	PG_RETURN_FLOAT8(result_val);
+}
+
+static Datum
+GetAggInitVal(Datum textInitVal, Oid transtype)
+{
+	Oid			typinput,
+				typioparam;
+	char	   *strInitVal;
+	Datum		initVal;
+
+	getTypeInputInfo(transtype, &typinput, &typioparam);
+	strInitVal = TextDatumGetCString(textInitVal);
+	initVal = OidInputFunctionCall(typinput, strInitVal,
+								   typioparam, -1);
+	pfree(strInitVal);
+	return initVal;
+}
+
+static void
+build_pertrans_for_aggref(AggStatePerTrans pertrans,
+						  AggState *aggstate)
+{
+	int			numGroupingSets = Max(aggstate->maxsets, 1);
+	Expr	   *transfnexpr;
+	int			numTransArgs;
+	Expr	   *serialfnexpr = NULL;
+	Expr	   *deserialfnexpr = NULL;
+	ListCell   *lc;
+	int			numInputs;
+	int			numDirectArgs;
+	List	   *sortlist;
+	int			numSortCols;
+	int			numDistinctCols;
+	int			i;
+	HeapTuple	aggTuple;
+	Form_pg_aggregate aggform;
+	Oid			aggTransFnInputTypes[FUNC_MAX_ARGS];
+	int			numAggTransFnArgs;
+	Aggref	   *aggref = pertrans->aggref;
+	EState	   *estate = aggstate->ss.ps.state;
+	Datum		textInitVal;
+	Datum		initValue;
+	bool		initValueIsNull;
+
+	if (aggref == NULL)
+		return;
+
+	/* Fetch the pg_aggregate row */
+	aggTuple = SearchSysCache1(AGGFNOID,
+							   ObjectIdGetDatum(aggref->aggfnoid));
+	if (!HeapTupleIsValid(aggTuple))
+		elog(ERROR, "cache lookup failed for aggregate %u",
+			 aggref->aggfnoid);
+	aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
+
+	/* Begin filling in the pertrans data */
+	pertrans->aggshared = false;
+	pertrans->aggCollation = aggref->inputcollid;
+	pertrans->transfn_oid = aggform->aggtransfn;
+	pertrans->serialfn_oid = aggform->aggserialfn;
+	pertrans->deserialfn_oid = aggform->aggdeserialfn;
+	pertrans->aggtranstype = aggform->aggtranstype;
+
+	/*
+	 * initval is potentially null, so don't try to access it as a struct
+	 * field. Must do it the hard way with SysCacheGetAttr.
+	 */
+	textInitVal = SysCacheGetAttr(AGGFNOID, aggTuple,
+								  Anum_pg_aggregate_agginitval,
+								  &initValueIsNull);
+	if (initValueIsNull)
+		initValue = (Datum) 0;
+	else
+		initValue = GetAggInitVal(textInitVal, pertrans->aggtranstype);
+
+	ReleaseSysCache(aggTuple);
+
+	pertrans->initValue = initValue;
+	pertrans->initValueIsNull = initValueIsNull;
+
+	/* Count the "direct" arguments, if any */
+	numDirectArgs = list_length(aggref->aggdirectargs);
+
+	/* Count the number of aggregated input columns */
+	pertrans->numInputs = numInputs = list_length(aggref->args);
+
+	/*
+	 * Get actual datatypes of the (nominal) aggregate inputs.  These could be
+	 * different from the agg's declared input types, when the agg accepts ANY
+	 * or a polymorphic type.
+	 */
+	numAggTransFnArgs = get_aggregate_argtypes(aggref,
+											   aggTransFnInputTypes);
+	pertrans->numTransInputs = numAggTransFnArgs;
+	/* account for the current transition state */
+	numTransArgs = pertrans->numTransInputs + 1;
+
+	/*
+	 * Set up infrastructure for calling the transfn.  Note that invtransfn is
+	 * not needed here.
+	 */
+	build_aggregate_transfn_expr(aggTransFnInputTypes,
+								 numAggTransFnArgs,
+								 numDirectArgs,
+								 aggref->aggvariadic,
+								 pertrans->aggtranstype,
+								 aggref->inputcollid,
+								 pertrans->transfn_oid,
+								 InvalidOid,
+								 &transfnexpr,
+								 NULL);
+
+	fmgr_info(pertrans->transfn_oid, &pertrans->transfn);
+	fmgr_info_set_expr((Node *) transfnexpr, &pertrans->transfn);
+
+	pertrans->transfn_fcinfo =
+		(FunctionCallInfo) palloc(SizeForFunctionCallInfo(numTransArgs));
+	InitFunctionCallInfoData(*pertrans->transfn_fcinfo,
+							 &pertrans->transfn,
+							 numTransArgs,
+							 pertrans->aggCollation,
+							 (void *) aggstate, NULL);
+
+	/* get info about the state value's datatype */
+	get_typlenbyval(pertrans->aggtranstype,
+					&pertrans->transtypeLen,
+					&pertrans->transtypeByVal);
+
+	if (OidIsValid(pertrans->serialfn_oid))
+	{
+		build_aggregate_serialfn_expr(pertrans->serialfn_oid,
+									  &serialfnexpr);
+		fmgr_info(pertrans->serialfn_oid, &pertrans->serialfn);
+		fmgr_info_set_expr((Node *) serialfnexpr, &pertrans->serialfn);
+
+		pertrans->serialfn_fcinfo =
+			(FunctionCallInfo) palloc(SizeForFunctionCallInfo(1));
+		InitFunctionCallInfoData(*pertrans->serialfn_fcinfo,
+								 &pertrans->serialfn,
+								 1,
+								 InvalidOid,
+								 (void *) aggstate, NULL);
+	}
+
+	if (OidIsValid(pertrans->deserialfn_oid))
+	{
+		build_aggregate_deserialfn_expr(pertrans->deserialfn_oid,
+										&deserialfnexpr);
+		fmgr_info(pertrans->deserialfn_oid, &pertrans->deserialfn);
+		fmgr_info_set_expr((Node *) deserialfnexpr, &pertrans->deserialfn);
+
+		pertrans->deserialfn_fcinfo =
+			(FunctionCallInfo) palloc(SizeForFunctionCallInfo(2));
+		InitFunctionCallInfoData(*pertrans->deserialfn_fcinfo,
+								 &pertrans->deserialfn,
+								 2,
+								 InvalidOid,
+								 (void *) aggstate, NULL);
+	}
+
+	/*
+	 * If we're doing either DISTINCT or ORDER BY for a plain agg, then we
+	 * have a list of SortGroupClause nodes; fish out the data in them and
+	 * stick them into arrays.  We ignore ORDER BY for an ordered-set agg,
+	 * however; the agg's transfn and finalfn are responsible for that.
+	 *
+	 * When the planner has set the aggpresorted flag, the input to the
+	 * aggregate is already correctly sorted.  For ORDER BY aggregates we can
+	 * simply treat these as normal aggregates.  For presorted DISTINCT
+	 * aggregates an extra step must be added to remove duplicate consecutive
+	 * inputs.
+	 *
+	 * Note that by construction, if there is a DISTINCT clause then the ORDER
+	 * BY clause is a prefix of it (see transformDistinctClause).
+	 */
+	if (AGGKIND_IS_ORDERED_SET(aggref->aggkind))
+	{
+		sortlist = NIL;
+		numSortCols = numDistinctCols = 0;
+		pertrans->aggsortrequired = false;
+	}
+	else if (aggref->aggpresorted && aggref->aggdistinct == NIL)
+	{
+		sortlist = NIL;
+		numSortCols = numDistinctCols = 0;
+		pertrans->aggsortrequired = false;
+	}
+	else if (aggref->aggdistinct)
+	{
+		sortlist = aggref->aggdistinct;
+		numSortCols = numDistinctCols = list_length(sortlist);
+		Assert(numSortCols >= list_length(aggref->aggorder));
+		pertrans->aggsortrequired = !aggref->aggpresorted;
+	}
+	else
+	{
+		sortlist = aggref->aggorder;
+		numSortCols = list_length(sortlist);
+		numDistinctCols = 0;
+		pertrans->aggsortrequired = (numSortCols > 0);
+	}
+
+	pertrans->numSortCols = 0;
+	pertrans->numDistinctCols = 0;
+
+	/*
+	 * If we have either sorting or filtering to do, create a tupledesc and
+	 * slot corresponding to the aggregated inputs (including sort
+	 * expressions) of the agg.
+	 */
+	if (numSortCols > 0 || aggref->aggfilter)
+	{
+		pertrans->sortdesc = ExecTypeFromTL(aggref->args);
+		pertrans->sortslot =
+			ExecInitExtraTupleSlot(estate, pertrans->sortdesc,
+								   &TTSOpsMinimalTuple);
+	}
+
+	if (numSortCols > 0)
+	{
+		/*
+		 * We don't implement DISTINCT or ORDER BY aggs in the HASHED case
+		 * (yet)
+		 */
+		Assert(aggstate->aggstrategy != AGG_HASHED && aggstate->aggstrategy != AGG_MIXED);
+
+		/* ORDER BY aggregates are not supported with partial aggregation */
+		Assert(!DO_AGGSPLIT_COMBINE(aggstate->aggsplit));
+
+		/* If we have only one input, we need its len/byval info. */
+		if (numInputs == 1)
+		{
+			get_typlenbyval(aggTransFnInputTypes[numDirectArgs],
+							&pertrans->inputtypeLen,
+							&pertrans->inputtypeByVal);
+		}
+		else if (numDistinctCols > 0)
+		{
+			/* we will need an extra slot to store prior values */
+			pertrans->uniqslot =
+				ExecInitExtraTupleSlot(estate, pertrans->sortdesc,
+									   &TTSOpsMinimalTuple);
+		}
+
+		/* Extract the sort information for use later */
+		pertrans->sortColIdx =
+			(AttrNumber *) palloc(numSortCols * sizeof(AttrNumber));
+		pertrans->sortOperators =
+			(Oid *) palloc(numSortCols * sizeof(Oid));
+		pertrans->sortCollations =
+			(Oid *) palloc(numSortCols * sizeof(Oid));
+		pertrans->sortNullsFirst =
+			(bool *) palloc(numSortCols * sizeof(bool));
+
+		i = 0;
+		foreach(lc, sortlist)
+		{
+			SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+			TargetEntry *tle = get_sortgroupclause_tle(sortcl, aggref->args);
+
+			/* the parser should have made sure of this */
+			Assert(OidIsValid(sortcl->sortop));
+
+			pertrans->sortColIdx[i] = tle->resno;
+			pertrans->sortOperators[i] = sortcl->sortop;
+			pertrans->sortCollations[i] = exprCollation((Node *) tle->expr);
+			pertrans->sortNullsFirst[i] = sortcl->nulls_first;
+			i++;
+		}
+		Assert(i == numSortCols);
+	}
+
+	if (aggref->aggdistinct)
+	{
+		Oid		   *ops;
+
+		Assert(numTransArgs > 0);
+		Assert(list_length(aggref->aggdistinct) == numDistinctCols);
+
+		ops = palloc(numDistinctCols * sizeof(Oid));
+
+		i = 0;
+		foreach(lc, aggref->aggdistinct)
+			ops[i++] = ((SortGroupClause *) lfirst(lc))->eqop;
+
+		/* lookup / build the necessary comparators */
+		if (numDistinctCols == 1)
+			fmgr_info(get_opcode(ops[0]), &pertrans->equalfnOne);
+		else
+			pertrans->equalfnMulti =
+				execTuplesMatchPrepare(pertrans->sortdesc,
+									   numDistinctCols,
+									   pertrans->sortColIdx,
+									   ops,
+									   pertrans->sortCollations,
+									   &aggstate->ss.ps);
+		pfree(ops);
+	}
+
+	pertrans->sortstates = (Tuplesortstate **)
+		palloc0(sizeof(Tuplesortstate *) * numGroupingSets);
+}
+
+/*
+ * Given new input value(s), advance the transition function of one aggregate
+ * state within one grouping set only (already set in aggstate->current_set)
+ *
+ * The new values (and null flags) have been preloaded into argument positions
+ * 1 and up in pertrans->transfn_fcinfo, so that we needn't copy them again to
+ * pass to the transition function.  We also expect that the static fields of
+ * the fcinfo are already initialized; that was done by ExecInitAgg().
+ *
+ * It doesn't matter which memory context this is called in.
+ */
+static void
+advance_transition_function(AggState *aggstate,
+							AggStatePerTrans pertrans,
+							AggStatePerGroup pergroupstate)
+{
+	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	MemoryContext oldContext;
+	Datum		newVal;
+
+	if (pertrans->transfn.fn_strict)
+	{
+		/*
+		 * For a strict transfn, nothing happens when there's a NULL input; we
+		 * just keep the prior transValue.
+		 */
+		int			numTransInputs = pertrans->numTransInputs;
+		int			i;
+
+		for (i = 1; i <= numTransInputs; i++)
+		{
+			if (fcinfo->args[i].isnull)
+				return;
+		}
+		if (pergroupstate->noTransValue)
+		{
+			/*
+			 * transValue has not been initialized. This is the first non-NULL
+			 * input value. We use it as the initial value for transValue. (We
+			 * already checked that the agg's input type is binary-compatible
+			 * with its transtype, so straight copy here is OK.)
+			 *
+			 * We must copy the datum into aggcontext if it is pass-by-ref. We
+			 * do not need to pfree the old transValue, since it's NULL.
+			 */
+			oldContext = MemoryContextSwitchTo(aggstate->curaggcontext->ecxt_per_tuple_memory);
+			pergroupstate->transValue = datumCopy(fcinfo->args[1].value,
+												  pertrans->transtypeByVal,
+												  pertrans->transtypeLen);
+			pergroupstate->transValueIsNull = false;
+			pergroupstate->noTransValue = false;
+			MemoryContextSwitchTo(oldContext);
+			return;
+		}
+		if (pergroupstate->transValueIsNull)
+		{
+			/*
+			 * Don't call a strict function with NULL inputs.  Note it is
+			 * possible to get here despite the above tests, if the transfn is
+			 * strict *and* returned a NULL on a prior cycle. If that happens
+			 * we will propagate the NULL all the way to the end.
+			 */
+			return;
+		}
+	}
+
+	/* We run the transition functions in per-input-tuple memory context */
+	oldContext = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
+
+	/* set up aggstate->curpertrans for AggGetAggref() */
+	aggstate->curpertrans = pertrans;
+
+	/*
+	 * OK to call the transition function
+	 */
+	fcinfo->args[0].value = pergroupstate->transValue;
+	fcinfo->args[0].isnull = pergroupstate->transValueIsNull;
+	fcinfo->isnull = false;		/* just in case transfn doesn't set it */
+
+	newVal = FunctionCallInvoke(fcinfo);
+
+	aggstate->curpertrans = NULL;
+
+	/*
+	 * If pass-by-ref datatype, must copy the new value into aggcontext and
+	 * free the prior transValue.  But if transfn returned a pointer to its
+	 * first input, we don't need to do anything.
+	 *
+	 * It's safe to compare newVal with pergroup->transValue without regard
+	 * for either being NULL, because ExecAggCopyTransValue takes care to set
+	 * transValue to 0 when NULL. Otherwise we could end up accidentally not
+	 * reparenting, when the transValue has the same numerical value as
+	 * newValue, despite being NULL.  This is a somewhat hot path, making it
+	 * undesirable to instead solve this with another branch for the common
+	 * case of the transition function returning its (modified) input
+	 * argument.
+	 */
+	if (!pertrans->transtypeByVal &&
+		DatumGetPointer(newVal) != DatumGetPointer(pergroupstate->transValue))
+		newVal = ExecAggCopyTransValue(aggstate, pertrans,
+									   newVal, fcinfo->isnull,
+									   pergroupstate->transValue,
+									   pergroupstate->transValueIsNull);
+
+	pergroupstate->transValue = newVal;
+	pergroupstate->transValueIsNull = fcinfo->isnull;
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+static void
+complete_fcinfo(AggStatePerTrans pertrans, TupleTableSlot *slot)
+{
+	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	int			numTransInputs = pertrans->numTransInputs;
+	int			i;
+
+	/* set up the aggregate transition state */
+	for (i = 1; i <= numTransInputs; i++)
+	{
+		fcinfo->args[i].value = slot_getattr(slot, i, &(fcinfo->args[i].isnull));
+	}
+}
+
+static void
+finalize_aggregate(AggState *aggstate,
+				   AggStatePerTrans pertrans,
+				   AggStatePerGroup pergroupstate,
+				   Datum *resultVal, bool *resultIsNull)
+{
+	LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
+	bool		anynull = false;
+	MemoryContext oldContext;
+	Aggref	   *aggref;
+	HeapTuple	aggTuple;
+	Form_pg_aggregate aggform;
+	Oid			aggtranstype;
+	Oid			finalfn_oid;
+	FmgrInfo	finalfn;
+	Expr	   *finalfnexpr;
+	Oid			aggTransFnInputTypes[FUNC_MAX_ARGS];
+	int16		resulttypeLen;
+	bool		resulttypeByVal;
+
+	oldContext = MemoryContextSwitchTo(aggstate->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+	aggref = pertrans->aggref;
+
+	/* Fetch the pg_aggregate row */
+	aggTuple = SearchSysCache1(AGGFNOID,
+							   ObjectIdGetDatum(aggref->aggfnoid));
+	if (!HeapTupleIsValid(aggTuple))
+		elog(ERROR, "cache lookup failed for aggregate %u",
+			 aggref->aggfnoid);
+	aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
+	finalfn_oid = aggform->aggfinalfn;
+	aggtranstype = aggform->aggtranstype;
+	ReleaseSysCache(aggTuple);
+
+	get_aggregate_argtypes(aggref, aggTransFnInputTypes);
+	get_typlenbyval(aggref->aggrestype,
+					&resulttypeLen,
+					&resulttypeByVal);
+
+	/*
+	 * Apply the agg's finalfn if one is provided, else return transValue.
+	 */
+	if (OidIsValid(finalfn_oid))
+	{
+		int			numFinalArgs = 1;
+
+		build_aggregate_finalfn_expr(aggTransFnInputTypes,
+									 numFinalArgs,
+									 aggtranstype,
+									 aggref->aggrestype,
+									 aggref->inputcollid,
+									 finalfn_oid,
+									 &finalfnexpr);
+		fmgr_info(finalfn_oid, &finalfn);
+		fmgr_info_set_expr((Node *) finalfnexpr, &finalfn);
+
+
+		InitFunctionCallInfoData(*fcinfo, &finalfn,
+								 numFinalArgs,
+								 pertrans->aggCollation,
+								 (void *) aggstate, NULL);
+
+		/* Fill in the transition state value */
+		fcinfo->args[0].value =
+			MakeExpandedObjectReadOnly(pergroupstate->transValue,
+									   pergroupstate->transValueIsNull,
+									   pertrans->transtypeLen);
+		fcinfo->args[0].isnull = pergroupstate->transValueIsNull;
+		anynull |= pergroupstate->transValueIsNull;
+
+		/* Fill any remaining argument positions with nulls */
+		for (int i = 1; i < numFinalArgs; i++)
+		{
+			fcinfo->args[i].value = (Datum) 0;
+			fcinfo->args[i].isnull = true;
+			anynull = true;
+		}
+
+		if (fcinfo->flinfo->fn_strict && anynull)
+		{
+			/* don't call a strict function with NULL inputs */
+			*resultVal = (Datum) 0;
+			*resultIsNull = true;
+		}
+		else
+		{
+			Datum		result;
+
+			result = FunctionCallInvoke(fcinfo);
+			*resultIsNull = fcinfo->isnull;
+			*resultVal = MakeExpandedObjectReadOnly(result,
+													fcinfo->isnull,
+													resulttypeLen);
+		}
+		aggstate->curperagg = NULL;
+	}
+	else
+	{
+		*resultVal =
+			MakeExpandedObjectReadOnly(pergroupstate->transValue,
+									   pergroupstate->transValueIsNull,
+									   pertrans->transtypeLen);
+		*resultIsNull = pergroupstate->transValueIsNull;
+	}
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+
+
+Datum
+dense_rank_keep_first(PG_FUNCTION_ARGS)
+{
+	ExprContext *econtext;
+	ExprState  *compareTuple;
+	OSAPerGroupState *osastate;
+	int			numDistinctCols;
+	Datum		abbrevVal = (Datum) 0;
+	Datum		abbrevOld = (Datum) 0;
+	TupleTableSlot *slot;
+	TupleTableSlot *extraslot;
+	TupleTableSlot *slot2;
+	AggState   *aggstate;
+	Datum		resvalue;
+	bool		resnull;
+	AggStatePerTrans nexttransstate = NULL;
+	AggStatePerGroup pergroupstate = NULL;
+
+	Assert(fcinfo->context && IsA(fcinfo->context, AggState));
+	Assert(AggCheckCallContext(fcinfo, NULL) == AGG_CONTEXT_AGGREGATE);
+
+	aggstate = (AggState *) fcinfo->context;
+	osastate = (OSAPerGroupState *) PG_GETARG_POINTER(0);
+	econtext = osastate->qstate->econtext;
+	if (!econtext)
+	{
+		MemoryContext oldcontext;
+
+		/* Make sure to we create econtext under correct parent context. */
+		oldcontext = MemoryContextSwitchTo(osastate->qstate->qcontext);
+		osastate->qstate->econtext = CreateStandaloneExprContext();
+		econtext = osastate->qstate->econtext;
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	/*
+	 * When comparing tuples, we can omit the flag column since we will only
+	 * compare rows with flag == 0.
+	 */
+	numDistinctCols = osastate->qstate->numSortCols;
+
+	/* Build tuple comparator, if we didn't already */
+	compareTuple = osastate->qstate->compareTuple;
+	if (compareTuple == NULL)
+	{
+		AttrNumber *sortColIdx = osastate->qstate->sortColIdx;
+		MemoryContext oldContext;
+
+		oldContext = MemoryContextSwitchTo(osastate->qstate->qcontext);
+		compareTuple = execTuplesMatchPrepare(osastate->qstate->tupdesc,
+											  numDistinctCols,
+											  sortColIdx,
+											  osastate->qstate->eqOperators,
+											  osastate->qstate->sortCollations,
+											  NULL);
+		MemoryContextSwitchTo(oldContext);
+		osastate->qstate->compareTuple = compareTuple;
+	}
+
+	Assert(!osastate->sort_done);
+
+	/* finish the sort */
+	tuplesort_performsort(osastate->sortstate);
+	osastate->sort_done = true;
+
+	/*
+	 * We alternate fetching into tupslot and extraslot so that we have the
+	 * previous row available for comparisons.  This is accomplished by
+	 * swapping the slot pointer variables after each row.
+	 */
+	extraslot = MakeSingleTupleTableSlot(osastate->qstate->tupdesc,
+										 &TTSOpsMinimalTuple);
+	slot2 = extraslot;
+	slot = osastate->qstate->tupslot;
+
+	nexttransstate = (AggStatePerTrans) palloc0(sizeof(AggStatePerTransData));
+	nexttransstate->aggref = aggstate->curpertrans->aggref->origin;
+	/* better be checked in parse_func.c */
+	/* Assert(nexttransstate->aggref->aggkind == AGGKIN_NORMAL); */
+
+	build_pertrans_for_aggref(nexttransstate, aggstate);
+	pergroupstate = (AggStatePerGroup) palloc0(sizeof(AggStatePerGroupData));
+	pergroupstate->transValue = nexttransstate->initValue;
+	pergroupstate->transValueIsNull = nexttransstate->initValueIsNull;
+	/* see comments in struce AggStatePerGroupData */
+	pergroupstate->noTransValue = nexttransstate->initValueIsNull;
+
+	while (tuplesort_gettupleslot(osastate->sortstate, true, true, slot,
+								  &abbrevVal))
+	{
+		TupleTableSlot *tmpslot;
+
+		econtext->ecxt_outertuple = slot;
+		econtext->ecxt_innertuple = slot2;
+
+		if (TupIsNull(slot2) ||
+			(abbrevVal == abbrevOld &&
+			 ExecQual(compareTuple, econtext)))
+		{
+			tmpslot = slot2;
+			slot2 = slot;
+			slot = tmpslot;
+			/* avoid ExecQual() calls by reusing abbreviated keys */
+			abbrevOld = abbrevVal;
+
+			/* apply sum/avg/min/max/count/variance/stddev */
+			complete_fcinfo(nexttransstate, slot2);
+			advance_transition_function(aggstate, nexttransstate, pergroupstate);
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+		}
+		else
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextReset(econtext->ecxt_per_tuple_memory);
+
+	econtext = aggstate->ss.ps.ps_ExprContext;
+	finalize_aggregate(aggstate, nexttransstate, pergroupstate, &resvalue, &resnull);
+
+	ExecClearTuple(slot);
+	ExecClearTuple(slot2);
+
+	ExecDropSingleTupleTableSlot(extraslot);
+
+	pfree(nexttransstate);
+	pfree(pergroupstate);
+
+	if (resnull)
+		PG_RETURN_NULL();
+
+	PG_RETURN_DATUM(resvalue);
 }
 
 /*

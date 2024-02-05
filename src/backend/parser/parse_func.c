@@ -22,6 +22,7 @@
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/primnodes.h"
 #include "parser/parse_agg.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
@@ -33,6 +34,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/catcache.h"
 
 
 /* Possible error codes from LookupFuncNameInternal */
@@ -764,7 +766,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		Aggref	   *aggref = makeNode(Aggref);
 
 		aggref->aggfnoid = funcid;
-		aggref->aggtype = rettype;
+		aggref->aggrestype = rettype;
 		/* aggcollid and inputcollid will be set by parse_collate.c */
 		aggref->aggtranstype = InvalidOid;	/* will be set by planner */
 		/* aggargtypes will be set by transformAggregateCall */
@@ -780,6 +782,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		aggref->aggno = -1;		/* planner will set aggno and aggtransno */
 		aggref->aggtransno = -1;
 		aggref->location = location;
+		aggref->origin = NULL;
+		aggref->dr_keep = DENSE_RANK_KEEP_NONE;
 
 		/*
 		 * Reject attempt to call a parameterless aggregate without (*)
@@ -815,6 +819,38 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 
 		/* parse_agg.c does additional aggregate-specific processing */
 		transformAggregateCall(pstate, aggref, fargs, agg_order, agg_distinct);
+
+		if (fn->dense_rank)
+		{
+			char	   *funcname = NULL;
+			CatCList   *catlist = NULL;
+			HeapTuple	proctup;
+			Form_pg_proc procform;
+			Aggref	   *aggref2 = copyObject(aggref);
+
+			aggref2->origin = aggref;
+			aggref2->dr_keep = fn->dense_rank->keep;
+
+			switch (aggref2->dr_keep)
+			{
+				case DENSE_RANK_KEEP_FIRST:
+					funcname = "dense_rank_first";
+					break;
+				default:
+					break;
+			}
+
+			catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+			Assert(catlist->n_members == 1);
+			proctup = &catlist->members[0]->tuple;
+			procform = (Form_pg_proc) GETSTRUCT(proctup);
+
+			aggref2->aggfnoid = procform->oid;
+			aggref2->aggkind = 'o';
+			ReleaseCatCacheList(catlist);
+
+			aggref = aggref2;
+		}
 
 		retval = (Node *) aggref;
 	}

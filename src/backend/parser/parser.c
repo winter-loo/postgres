@@ -146,6 +146,9 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 		case NULLS_P:
 			cur_token_length = 5;
 			break;
+		case KEEP_P:
+			cur_token_length = 4;
+			break;
 		case WITH:
 			cur_token_length = 4;
 			break;
@@ -225,6 +228,15 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 				case FIRST_P:
 				case LAST_P:
 					cur_token = NULLS_LA;
+					break;
+			}
+			break;
+
+		case KEEP_P:
+			switch (next_token)
+			{
+				case '(':
+					cur_token = KEEP_LA;
 					break;
 			}
 			break;

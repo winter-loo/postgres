@@ -201,7 +201,7 @@ preprocess_aggref(Aggref *aggref, PlannerInfo *root)
 	shareable = (aggform->aggfinalmodify != AGGMODIFY_READ_WRITE);
 
 	/* get info about the output value's datatype */
-	get_typlenbyval(aggref->aggtype,
+	get_typlenbyval(aggref->aggrestype,
 					&resulttypeLen,
 					&resulttypeByVal);
 
@@ -423,7 +423,7 @@ find_compatible_agg(PlannerInfo *root, Aggref *newagg,
 
 		/* if it's the same aggregate function then report exact match */
 		if (newagg->aggfnoid == existingRef->aggfnoid &&
-			newagg->aggtype == existingRef->aggtype &&
+			newagg->aggrestype == existingRef->aggrestype &&
 			newagg->aggcollid == existingRef->aggcollid &&
 			equal(newagg->aggdirectargs, existingRef->aggdirectargs))
 		{

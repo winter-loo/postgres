@@ -370,6 +370,14 @@ typedef struct Param
 	int			location;
 } Param;
 
+typedef enum DenseRankKeep
+{
+	DENSE_RANK_KEEP_NONE,
+	DENSE_RANK_KEEP_FIRST,
+	DENSE_RANK_KEEP_LAST,
+	DENSE_RANK_KEEP_MIDDLE,
+}			DenseRankKeep;
+
 /*
  * Aggref
  *
@@ -430,7 +438,7 @@ typedef struct Aggref
 	Oid			aggfnoid;
 
 	/* type Oid of result of the aggregate */
-	Oid			aggtype pg_node_attr(query_jumble_ignore);
+	Oid			aggrestype pg_node_attr(query_jumble_ignore);
 
 	/* OID of collation of result */
 	Oid			aggcollid pg_node_attr(query_jumble_ignore);
@@ -491,6 +499,9 @@ typedef struct Aggref
 
 	/* token location, or -1 if unknown */
 	int			location;
+
+	struct Aggref *origin pg_node_attr(query_jumble_ignore);
+	DenseRankKeep dr_keep pg_node_attr(query_jumble_ignore);
 } Aggref;
 
 /*

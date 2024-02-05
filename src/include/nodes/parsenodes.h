@@ -396,6 +396,13 @@ typedef struct RoleSpec
 	int			location;		/* token location, or -1 if unknown */
 } RoleSpec;
 
+typedef struct DenseRank
+{
+	NodeTag		type;
+	DenseRankKeep keep;
+	List	   *agg_order;		/* ORDER BY clause, must have */
+}			DenseRank;
+
 /*
  * FuncCall - a function or aggregate invocation
  *
@@ -424,6 +431,7 @@ typedef struct FuncCall
 	bool		func_variadic;	/* last argument was labeled VARIADIC */
 	CoercionForm funcformat;	/* how to display this node */
 	int			location;		/* token location, or -1 if unknown */
+	DenseRank  *dense_rank;
 } FuncCall;
 
 /*

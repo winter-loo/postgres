@@ -5471,9 +5471,9 @@ mark_partial_aggref(Aggref *agg, AggSplit aggsplit)
 	if (DO_AGGSPLIT_SKIPFINAL(aggsplit))
 	{
 		if (agg->aggtranstype == INTERNALOID && DO_AGGSPLIT_SERIALIZE(aggsplit))
-			agg->aggtype = BYTEAOID;
+			agg->aggrestype = BYTEAOID;
 		else
-			agg->aggtype = agg->aggtranstype;
+			agg->aggrestype = agg->aggtranstype;
 	}
 }
 

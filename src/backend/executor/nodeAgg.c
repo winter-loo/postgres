@@ -371,9 +371,6 @@ static TupleTableSlot *fetch_input_tuple(AggState *aggstate);
 static void initialize_aggregates(AggState *aggstate,
 								  AggStatePerGroup *pergroups,
 								  int numReset);
-static void advance_transition_function(AggState *aggstate,
-										AggStatePerTrans pertrans,
-										AggStatePerGroup pergroupstate);
 static void advance_aggregates(AggState *aggstate);
 static void process_ordered_aggregate_single(AggState *aggstate,
 											 AggStatePerTrans pertrans,
@@ -381,10 +378,6 @@ static void process_ordered_aggregate_single(AggState *aggstate,
 static void process_ordered_aggregate_multi(AggState *aggstate,
 											AggStatePerTrans pertrans,
 											AggStatePerGroup pergroupstate);
-static void finalize_aggregate(AggState *aggstate,
-							   AggStatePerAgg peragg,
-							   AggStatePerGroup pergroupstate,
-							   Datum *resultVal, bool *resultIsNull);
 static void finalize_partialaggregate(AggState *aggstate,
 									  AggStatePerAgg peragg,
 									  AggStatePerGroup pergroupstate,
@@ -3813,7 +3806,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 			build_aggregate_finalfn_expr(aggTransFnInputTypes,
 										 peragg->numFinalArgs,
 										 aggtranstype,
-										 aggref->aggtype,
+										 aggref->aggrestype,
 										 aggref->inputcollid,
 										 finalfn_oid,
 										 &finalfnexpr);
@@ -3822,7 +3815,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 		}
 
 		/* get info about the output value's datatype */
-		get_typlenbyval(aggref->aggtype,
+		get_typlenbyval(aggref->aggrestype,
 						&peragg->resulttypeLen,
 						&peragg->resulttypeByVal);
 
@@ -3906,7 +3899,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 			else
 			{
 				/* Detect how many arguments to pass to the transfn */
-				if (AGGKIND_IS_ORDERED_SET(aggref->aggkind))
+				if (AGGKIND_IS_ORDERED_SET(aggref->aggkind) || aggref->dr_keep != DENSE_RANK_KEEP_NONE)
 					pertrans->numTransInputs = list_length(aggref->args);
 				else
 					pertrans->numTransInputs = numAggTransFnArgs;
