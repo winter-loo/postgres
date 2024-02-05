@@ -267,6 +267,8 @@ typedef enum ExprEvalOp
 } ExprEvalOp;
 
 
+void		dprint_opcode(intptr_t opcode);
+
 typedef struct ExprEvalStep
 {
 	/*

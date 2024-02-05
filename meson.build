@@ -89,7 +89,7 @@ postgres_lib_d = get_option('extra_lib_dirs')
 
 cppflags = []
 
-cflags = []
+cflags = ['-g', '-O0']
 cxxflags = []
 cflags_warn = []
 cxxflags_warn = []

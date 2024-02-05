@@ -344,11 +344,12 @@ AllocSetFreeIndex(Size size)
  * AllocSetContextCreate.
  */
 MemoryContext
-AllocSetContextCreateInternal(MemoryContext parent,
-							  const char *name,
-							  Size minContextSize,
-							  Size initBlockSize,
-							  Size maxBlockSize)
+AllocSetContextCreateInternalLog(MemoryContext parent,
+								 const char *name,
+								 Size minContextSize,
+								 Size initBlockSize,
+								 Size maxBlockSize,
+								 const char *file, int line)
 {
 	int			freeListIndex;
 	Size		firstBlockSize;
@@ -384,6 +385,10 @@ AllocSetContextCreateInternal(MemoryContext parent,
 			minContextSize >= 1024 &&
 			minContextSize <= maxBlockSize));
 	Assert(maxBlockSize <= MEMORYCHUNK_MAX_BLOCKOFFSET);
+
+
+	if (ErrorContext && strcmp(name, ErrorContext->name) != 0)
+		elog(DEBUG5, "[%s:%d] memory context creation", file, line);
 
 	/*
 	 * Check whether the parameters match either available freelist.  We do
