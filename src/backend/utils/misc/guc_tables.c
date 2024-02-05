@@ -508,6 +508,7 @@ char	   *event_source;
 
 bool		row_security;
 bool		check_function_bodies = true;
+bool		analyze_function_bodies = false;
 
 /*
  * This GUC exists solely for backward compatibility, check its definition for
@@ -1635,6 +1636,15 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&check_function_bodies,
 		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"analyze_function_bodies", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("analyze routine bodies during CREATE FUNCTION and CREATE PROCEDURE."),
+			NULL
+		},
+		&analyze_function_bodies,
+		false,
 		NULL, NULL, NULL
 	},
 	{

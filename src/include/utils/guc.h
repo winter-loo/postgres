@@ -252,6 +252,7 @@ extern PGDLLIMPORT bool log_statement_stats;
 extern PGDLLIMPORT bool log_btree_build_stats;
 
 extern PGDLLIMPORT bool check_function_bodies;
+extern PGDLLIMPORT bool analyze_function_bodies;
 extern PGDLLIMPORT bool current_role_is_superuser;
 
 extern PGDLLIMPORT bool log_duration;

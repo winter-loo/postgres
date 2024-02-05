@@ -23,9 +23,12 @@
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/analyze.h"
 #include "parser/parse_type.h"
 #include "plpgsql.h"
 #include "utils/builtins.h"
+#include "utils/expandedrecord.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -237,6 +240,799 @@ recheck:
 	 */
 	return function;
 }
+
+/*
+ * analyze function bodies
+ * --{
+ */
+
+static TupleDesc GetTypeFromTL(List *targetList);
+static void analyze_stmt_block(PLpgSQL_function* fn, PLpgSQL_stmt_block *block);
+static void analyze_stmts(PLpgSQL_function* fn, List *stmts);
+static void plpgsql_analyzer_setup(struct ParseState *pstate, PLpgSQL_expr *expr);
+static List* sql_parse_and_analyze(PLpgSQL_function* fn, PLpgSQL_expr* expr);
+static void analyze_stmt_execsql(PLpgSQL_function* fn, PLpgSQL_stmt_execsql *stmt);
+
+static void
+analyze_stmt_if(PLpgSQL_function* fn, PLpgSQL_stmt_if *stmt)
+{
+	PLpgSQL_expr *cond = stmt->cond;
+	List *then_body = stmt->then_body;
+	ListCell *lc;
+
+	elog(DEBUG1, "analyze_stmt_if");
+
+	sql_parse_and_analyze(fn, cond);
+	analyze_stmts(fn, then_body);
+
+	foreach(lc, stmt->elsif_list)
+	{
+		PLpgSQL_if_elsif *elif = (PLpgSQL_if_elsif *) lfirst(lc);
+
+		sql_parse_and_analyze(fn, elif->cond);
+
+		analyze_stmts(fn, elif->stmts);
+	}
+
+	analyze_stmts(fn, stmt->else_body);
+}
+
+static void
+analyze_stmt_return(PLpgSQL_function* fn, PLpgSQL_stmt_return *stmt)
+{
+	PLpgSQL_expr *expr = stmt->expr;
+	PLpgSQL_execstate *estate;
+
+	estate = fn->cur_estate;
+
+	if (estate->retisset)
+		return;
+	elog(DEBUG1, "analyze_stmt_return");
+
+	if (expr)
+		sql_parse_and_analyze(fn, expr);
+}
+
+static void
+analyze_stmt_assign(PLpgSQL_function* fn, PLpgSQL_stmt_assign *stmt)
+{
+	PLpgSQL_expr *expr = stmt->expr;
+	PLpgSQL_datum *target;
+	PLpgSQL_execstate *estate;
+
+	elog(DEBUG1, "analyze_stmt_assign");
+
+	estate = fn->cur_estate;
+
+	target = (PLpgSQL_datum *) (estate->datums[stmt->varno]);
+	if (target->dtype == PLPGSQL_DTYPE_VAR)
+		expr->target_param = target->dno;
+	else
+		expr->target_param = -1;
+	sql_parse_and_analyze(fn, expr);
+}
+
+static void
+analyze_stmt_open(PLpgSQL_function* fn, PLpgSQL_stmt_open *stmt)
+{
+	PLpgSQL_var *curvar;
+	PLpgSQL_expr *query;
+	PLpgSQL_execstate *estate;
+
+	elog(DEBUG1, "analyze_stmt_open");
+
+	estate = fn->cur_estate;
+	/* ----------
+	 * Get the cursor variable and if it has an assigned name, check
+	 * that it's not in use currently.
+	 * ----------
+	 */
+	curvar = (PLpgSQL_var *) (estate->datums[stmt->curvar]);
+	/* do not check curname here */
+
+	/* ----------
+	 * Process the OPEN according to it's type.
+	 * ----------
+	 */
+	if (stmt->query != NULL)
+	{
+		/* ----------
+		 * This is an OPEN refcursor FOR SELECT ...
+		 *
+		 * We just make sure the query is planned. The real work is
+		 * done downstairs.
+		 * ----------
+		 */
+		query = stmt->query;
+		sql_parse_and_analyze(fn, query);
+		/* exec_prepare_plan(estate, query, stmt->cursor_options); */
+	}
+	else if (stmt->dynquery != NULL)
+	{
+		/* ----------
+		 * This is an OPEN refcursor FOR EXECUTE ...
+		 * ----------
+		 */
+		/* portal = exec_dynquery_with_params(estate,
+										   stmt->dynquery,
+										   stmt->params,
+										   curname,
+										   stmt->cursor_options); */
+		sql_parse_and_analyze(fn, stmt->dynquery);
+
+
+		/*
+		 * If cursor variable was NULL, store the generated portal name in it,
+		 * after verifying it's okay to assign to.
+		 *
+		 * Note: exec_dynquery_with_params already reset the stmt_mcontext, so
+		 * curname is a dangling pointer here; but testing it for nullness is
+		 * OK.
+		 */
+		/*
+		if (curname == NULL)
+		{
+			exec_check_assignable(estate, stmt->curvar);
+			assign_text_var(estate, curvar, portal->name);
+		}*/
+	}
+	else
+	{
+		/* ----------
+		 * This is an OPEN cursor
+		 *
+		 * Note: parser should already have checked that statement supplies
+		 * args iff cursor needs them, but we check again to be safe.
+		 * ----------
+		 */
+		if (stmt->argquery != NULL)
+		{
+			/* ----------
+			 * OPEN CURSOR with args.  We fake a SELECT ... INTO ...
+			 * statement to evaluate the args and put 'em into the
+			 * internal row.
+			 * ----------
+			 */
+			PLpgSQL_stmt_execsql set_args;
+
+			if (curvar->cursor_explicit_argrow < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("arguments given for cursor without arguments")));
+
+			memset(&set_args, 0, sizeof(set_args));
+			set_args.cmd_type = PLPGSQL_STMT_EXECSQL;
+			set_args.lineno = stmt->lineno;
+			set_args.sqlstmt = stmt->argquery;
+			set_args.into = true;
+			/* XXX historically this has not been STRICT */
+			set_args.target = (PLpgSQL_variable *)
+				(estate->datums[curvar->cursor_explicit_argrow]);
+
+			/* if (exec_stmt_execsql(estate, &set_args) != PLPGSQL_RC_OK)
+				elog(ERROR, "open cursor failed during argument processing"); */
+			analyze_stmt_execsql(fn, &set_args);
+		}
+		else
+		{
+			if (curvar->cursor_explicit_argrow >= 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("arguments required for cursor")));
+		}
+
+		query = curvar->cursor_explicit_expr;
+		/*
+		if (query->plan == NULL)
+			exec_prepare_plan(estate, query, curvar->cursor_options);*/
+		sql_parse_and_analyze(fn, query);
+	}
+}
+
+static void
+analyze_stmt_forc(PLpgSQL_function* fn, PLpgSQL_stmt_forc *stmt)
+{
+	PLpgSQL_var *curvar;
+	PLpgSQL_expr *query;
+	PLpgSQL_execstate *estate;
+	List* qrylist;
+	Query *qry;
+	TupleDesc tupdesc;
+	PLpgSQL_datum *datum;
+	ExpandedRecordHeader *newerh;
+	PLpgSQL_rec *rec;
+
+	elog(DEBUG1, "analyze_stmt_forc");
+
+	estate = fn->cur_estate;
+
+	curvar = (PLpgSQL_var *) (estate->datums[stmt->curvar]);
+	/* ----------
+	 * Open the cursor just like an OPEN command
+	 *
+	 * Note: parser should already have checked that statement supplies
+	 * args iff cursor needs them, but we check again to be safe.
+	 * ----------
+	 */
+	if (stmt->argquery != NULL)
+	{
+		/* ----------
+		 * OPEN CURSOR with args.  We fake a SELECT ... INTO ...
+		 * statement to evaluate the args and put 'em into the
+		 * internal row.
+		 * ----------
+		 */
+		PLpgSQL_stmt_execsql set_args;
+
+		if (curvar->cursor_explicit_argrow < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("arguments given for cursor without arguments")));
+
+		memset(&set_args, 0, sizeof(set_args));
+		set_args.cmd_type = PLPGSQL_STMT_EXECSQL;
+		set_args.lineno = stmt->lineno;
+		set_args.sqlstmt = stmt->argquery;
+		set_args.into = true;
+		/* XXX historically this has not been STRICT */
+		set_args.target = (PLpgSQL_variable *)
+			(estate->datums[curvar->cursor_explicit_argrow]);
+
+		analyze_stmt_execsql(fn, &set_args);
+	}
+	else
+	{
+		if (curvar->cursor_explicit_argrow >= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("arguments required for cursor")));
+	}
+
+	query = curvar->cursor_explicit_expr;
+	Assert(query);
+
+	qrylist = sql_parse_and_analyze(fn, query);
+	Assert(list_length(qrylist) == 1);
+
+	qry = (Query *) linitial_node(Query, qrylist);
+	tupdesc = GetTypeFromTL(qry->targetList);
+	datum = estate->datums[stmt->var->dno];
+
+	newerh = make_expanded_record_from_tupdesc(tupdesc, fn->fn_cxt);
+	Assert(datum->dtype == PLPGSQL_DTYPE_REC);
+	rec = (PLpgSQL_rec *) datum;
+	rec->erh = newerh;
+
+	analyze_stmts(fn, ((PLpgSQL_stmt_forq *)stmt)->body);
+}
+
+static void
+analyze_stmt_execsql(PLpgSQL_function* fn, PLpgSQL_stmt_execsql *stmt)
+{
+	PLpgSQL_expr *expr = stmt->sqlstmt;
+	elog(DEBUG1, "analyze_stmt_execsql");
+	sql_parse_and_analyze(fn, expr);
+}
+
+static void
+analyze_stmt_fori(PLpgSQL_function *fn, PLpgSQL_stmt_fori *stmt)
+{
+	elog(DEBUG1, "analyze_stmt_fori");
+	analyze_stmts(fn, stmt->body);
+}
+
+static void
+analyze_stmt_raise(PLpgSQL_function* fn, PLpgSQL_stmt_raise *stmt)
+{
+	ListCell   *lc;
+
+	elog(DEBUG1, "analyze_stmt_raise");
+	/* RAISE with no parameters: re-throw current exception */
+	if (stmt->condname == NULL && stmt->message == NULL &&
+		stmt->options == NIL)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_PLPGSQL_ERROR),
+				 errmsg("invalid RAISE statement")));
+	}
+
+	if (stmt->condname)
+	{
+		(void)plpgsql_recognize_err_condition(stmt->condname, true);
+	}
+
+	if (stmt->message)
+	{
+		ListCell   *current_param;
+		char	   *cp;
+
+		current_param = list_head(stmt->params);
+
+		for (cp = stmt->message; *cp; cp++)
+		{
+			/*
+			 * Occurrences of a single % are replaced by the next parameter's
+			 * external representation. Double %'s are converted to one %.
+			 */
+			if (cp[0] == '%')
+			{
+				PLpgSQL_expr *expr;
+
+				if (cp[1] == '%')
+				{
+					cp++;
+					continue;
+				}
+
+				/* should have been checked at compile time */
+				if (current_param == NULL)
+					elog(ERROR, "unexpected RAISE parameter list length");
+
+				expr = (PLpgSQL_expr *) lfirst(current_param);
+				sql_parse_and_analyze(fn, expr);
+
+				current_param = lnext(stmt->params, current_param);
+			}
+		}
+
+		/* should have been checked at compile time */
+		if (current_param != NULL)
+			elog(ERROR, "unexpected RAISE parameter list length");
+	}
+
+	foreach(lc, stmt->options)
+	{
+		PLpgSQL_raise_option *opt = (PLpgSQL_raise_option *) lfirst(lc);
+		sql_parse_and_analyze(fn, opt->expr);
+	}
+}
+
+static TupleDesc
+GetTypeFromTL(List *targetList)
+{
+	TupleDesc	typeInfo;
+	ListCell   *l;
+	int			len;
+	int			cur_resno = 1;
+
+	/* skipjunk = true */
+	len = ExecCleanTargetListLength(targetList);
+	typeInfo = CreateTemplateTupleDesc(len);
+
+	foreach(l, targetList)
+	{
+		TargetEntry *tle = lfirst(l);
+
+		if (tle->resjunk)
+			continue;
+		TupleDescInitEntry(typeInfo,
+						   cur_resno,
+						   tle->resname,
+						   exprType((Node *) tle->expr),
+						   exprTypmod((Node *) tle->expr),
+						   0);
+		TupleDescInitEntryCollation(typeInfo,
+									cur_resno,
+									exprCollation((Node *) tle->expr));
+		cur_resno++;
+	}
+
+	return typeInfo;
+}
+
+static List*
+analyze_select(PLpgSQL_function *fn, PLpgSQL_expr *expr)
+{
+	return sql_parse_and_analyze(fn, expr);
+}
+
+static void
+analyze_stmt_fors(PLpgSQL_function *fn, PLpgSQL_stmt_fors * stmt)
+{
+	List* qrylist;
+	Query* qry;
+	TupleDesc tupdesc;
+	PLpgSQL_datum *datum;
+	ExpandedRecordHeader *newerh;
+	PLpgSQL_rec *rec;
+	PLpgSQL_execstate *estate;
+
+	estate = fn->cur_estate;
+
+	qrylist = analyze_select(fn, stmt->query);
+
+	Assert(list_length(qrylist) == 1);
+
+	qry = (Query *) linitial_node(Query, qrylist);
+	tupdesc = GetTypeFromTL(qry->targetList);
+	datum = estate->datums[stmt->var->dno];
+
+	newerh = make_expanded_record_from_tupdesc(tupdesc, fn->fn_cxt);
+	rec = (PLpgSQL_rec *) datum;
+	rec->erh = newerh;
+
+	analyze_stmts(fn, stmt->body);
+}
+
+static void
+analyze_stmts(PLpgSQL_function *fn, List *stmts)
+{
+	ListCell   *s;
+
+	if (stmts == NIL)
+		return;
+
+	foreach(s, stmts)
+	{
+		PLpgSQL_stmt *stmt = (PLpgSQL_stmt *) lfirst(s);
+
+		/* what the hell is going on here? */
+		/* CHECK_FOR_INTERRUPTS(); */
+
+		switch (stmt->cmd_type)
+		{
+			case PLPGSQL_STMT_BLOCK:
+				analyze_stmt_block(fn, (PLpgSQL_stmt_block *) stmt);
+				break;
+
+			case PLPGSQL_STMT_ASSIGN:
+				analyze_stmt_assign(fn, (PLpgSQL_stmt_assign *) stmt);
+				break;
+
+			case PLPGSQL_STMT_PERFORM:
+				elog(DEBUG2, "PLPGSQL_STMT_PERFORM checking not implemented yet");
+				/* TODO: analyze_stmt_perform(fn, (PLpgSQL_stmt_perform *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_CALL:
+				elog(DEBUG2, "PLPGSQL_STMT_CALL checking not implemented yet");
+				/* TODO: analyze_stmt_call(fn, (PLpgSQL_stmt_call *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_GETDIAG:
+				elog(DEBUG2, "PLPGSQL_STMT_GETDIAG checking not implemented yet");
+				/* TODO: analyze_stmt_getdiag(fn, (PLpgSQL_stmt_getdiag *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_IF:
+				analyze_stmt_if(fn, (PLpgSQL_stmt_if *) stmt);
+				break;
+
+			case PLPGSQL_STMT_CASE:
+				elog(DEBUG2, "PLPGSQL_STMT_CASE checking not implemented yet");
+				/* TODO: analyze_stmt_case(fn, (PLpgSQL_stmt_case *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_LOOP:
+				elog(DEBUG2, "PLPGSQL_STMT_LOOP checking not implemented yet");
+				/* TODO: analyze_stmt_loop(fn, (PLpgSQL_stmt_loop *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_WHILE:
+				elog(DEBUG2, "PLPGSQL_STMT_WHILE checking not implemented yet");
+				/* TODO: analyze_stmt_while(fn, (PLpgSQL_stmt_while *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_FORI:
+				analyze_stmt_fori(fn, (PLpgSQL_stmt_fori *) stmt);
+				break;
+
+			case PLPGSQL_STMT_FORS:
+				analyze_stmt_fors(fn, (PLpgSQL_stmt_fors *) stmt);
+				break;
+
+			case PLPGSQL_STMT_FORC:
+				analyze_stmt_forc(fn, (PLpgSQL_stmt_forc *) stmt);
+				break;
+
+			case PLPGSQL_STMT_FOREACH_A:
+				elog(DEBUG2, "PLPGSQL_STMT_FOREACH_A checking not implemented yet");
+				/* TODO: analyze_stmt_foreach_a(fn, (PLpgSQL_stmt_foreach_a *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_EXIT:
+				elog(DEBUG2, "PLPGSQL_STMT_EXIT checking not implemented yet");
+				/* TODO: analyze_stmt_exit(fn, (PLpgSQL_stmt_exit *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_RETURN:
+				analyze_stmt_return(fn, (PLpgSQL_stmt_return *) stmt);
+				break;
+
+			case PLPGSQL_STMT_RETURN_NEXT:
+				elog(DEBUG2, "PLPGSQL_STMT_RETURN_NEXT checking not implemented yet");
+				/* TODO: analyze_stmt_return_next(fn, (PLpgSQL_stmt_return_next *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_RETURN_QUERY:
+				elog(DEBUG2, "PLPGSQL_STMT_RETURN_QUERY checking not implemented yet");
+				/* TODO: analyze_stmt_return_query(fn, (PLpgSQL_stmt_return_query *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_RAISE:
+				analyze_stmt_raise(fn, (PLpgSQL_stmt_raise *) stmt);
+				break;
+
+			case PLPGSQL_STMT_ASSERT:
+				elog(DEBUG2, "PLPGSQL_STMT_ASSERT checking not implemented yet");
+				/* TODO: analyze_stmt_assert(fn, (PLpgSQL_stmt_assert *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_EXECSQL:
+				analyze_stmt_execsql(fn, (PLpgSQL_stmt_execsql *) stmt);
+				break;
+
+			case PLPGSQL_STMT_DYNEXECUTE:
+				elog(DEBUG2, "PLPGSQL_STMT_DYNEXECUTE checking not implemented yet");
+				/* TODO: analyze_stmt_dynexecute(fn, (PLpgSQL_stmt_dynexecute *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_DYNFORS:
+				elog(DEBUG2, "PLPGSQL_STMT_DYNFORS checking not implemented yet");
+				/* TODO: analyze_stmt_dynfors(fn, (PLpgSQL_stmt_dynfors *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_OPEN:
+				analyze_stmt_open(fn, (PLpgSQL_stmt_open *) stmt);
+				break;
+
+			case PLPGSQL_STMT_FETCH:
+				elog(DEBUG2, "PLPGSQL_STMT_FETCH checking not implemented yet");
+				/* TODO: analyze_stmt_fetch(fn, (PLpgSQL_stmt_fetch *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_CLOSE:
+				elog(DEBUG2, "PLPGSQL_STMT_CLOSE checking not implemented yet");
+				/* TODO: analyze_stmt_close(fn, (PLpgSQL_stmt_close *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_COMMIT:
+				elog(DEBUG2, "PLPGSQL_STMT_COMMIT checking not implemented yet");
+				/* TODO: analyze_stmt_commit(fn, (PLpgSQL_stmt_commit *) stmt); */
+				break;
+
+			case PLPGSQL_STMT_ROLLBACK:
+				elog(DEBUG2, "PLPGSQL_STMT_ROLLBACK checking not implemented yet");
+				/* TODO: analyze_stmt_rollback(fn, (PLpgSQL_stmt_rollback *) stmt); */
+				break;
+
+			default:
+				/* point err_stmt to parent, since this one seems corrupt */
+				/* do I need this? */
+				/* estate->err_stmt = save_estmt; */
+				elog(ERROR, "unrecognized cmd_type: %d", stmt->cmd_type);
+		}
+	}
+}
+
+static void
+analyze_stmt_block(PLpgSQL_function *fn, PLpgSQL_stmt_block *block)
+{
+	elog(DEBUG1, "analyze_stmt_block");
+	analyze_stmts(fn, block->body);
+}
+
+static void
+analyze_toplevel_block(PLpgSQL_function *fn, PLpgSQL_stmt_block *block)
+{
+	analyze_stmt_block(fn, block);
+}
+
+static void
+plpgsql_estate_prepare(PLpgSQL_execstate *estate,
+					   PLpgSQL_function *func,
+					   ReturnSetInfo *rsi)
+{
+	func->cur_estate = estate;
+
+	estate->func = func;
+	estate->trigdata = NULL;
+	estate->evtrigdata = NULL;
+
+	estate->retval = (Datum) 0;
+	estate->retisnull = true;
+	estate->rettype = InvalidOid;
+
+	estate->fn_rettype = func->fn_rettype;
+	estate->retistuple = func->fn_retistuple;
+	estate->retisset = func->fn_retset;
+
+	estate->readonly_func = func->fn_readonly;
+	estate->atomic = true;
+
+	estate->exitlabel = NULL;
+	estate->cur_error = NULL;
+
+	estate->tuple_store = NULL;
+	estate->tuple_store_desc = NULL;
+	if (rsi)
+	{
+		estate->tuple_store_cxt = rsi->econtext->ecxt_per_query_memory;
+		estate->tuple_store_owner = CurrentResourceOwner;
+	}
+	else
+	{
+		estate->tuple_store_cxt = NULL;
+		estate->tuple_store_owner = NULL;
+	}
+	estate->rsi = rsi;
+
+	estate->found_varno = func->found_varno;
+	estate->ndatums = func->ndatums;
+	estate->datums = NULL;
+	/* the datums array will be filled by copy_plpgsql_datums() */
+	estate->datum_context = CurrentMemoryContext;
+
+	/* I dont actually execute any statement */
+	estate->paramLI = NULL;
+
+	estate->simple_eval_estate = NULL;
+	estate->cast_hash = NULL;
+	estate->simple_eval_resowner = NULL;
+
+	/* if there's a procedure resowner, it'll be filled in later */
+	estate->procedure_resowner = NULL;
+
+	/*
+	 * We start with no stmt_mcontext; one will be created only if needed.
+	 * That context will be a direct child of the function's main execution
+	 * context.  Additional stmt_mcontexts might be created as children of it.
+	 */
+	estate->stmt_mcontext = NULL;
+	estate->stmt_mcontext_parent = CurrentMemoryContext;
+
+	estate->eval_tuptable = NULL;
+	estate->eval_processed = 0;
+	estate->eval_econtext = NULL;
+
+	estate->err_stmt = NULL;
+	estate->err_var = NULL;
+	estate->err_text = NULL;
+
+	estate->plugin_info = NULL;
+}
+
+/* ----------
+ * Support function for initializing local execution variables
+ * ----------
+ */
+static void
+copy_plpgsql_datums(PLpgSQL_execstate *estate,
+					PLpgSQL_function *func)
+{
+	int			ndatums = estate->ndatums;
+	PLpgSQL_datum **indatums;
+	PLpgSQL_datum **outdatums;
+	char	   *workspace;
+	char	   *ws_next;
+	int			i;
+
+	/* Allocate local datum-pointer array */
+	estate->datums = (PLpgSQL_datum **)
+		palloc(sizeof(PLpgSQL_datum *) * ndatums);
+
+	/*
+	 * To reduce palloc overhead, we make a single palloc request for all the
+	 * space needed for locally-instantiated datums.
+	 */
+	workspace = palloc(func->copiable_size);
+	ws_next = workspace;
+
+	/* Fill datum-pointer array, copying datums into workspace as needed */
+	indatums = func->datums;
+	outdatums = estate->datums;
+	for (i = 0; i < ndatums; i++)
+	{
+		PLpgSQL_datum *indatum = indatums[i];
+		PLpgSQL_datum *outdatum;
+
+		/* This must agree with plpgsql_finish_datums on what is copiable */
+		switch (indatum->dtype)
+		{
+			case PLPGSQL_DTYPE_VAR:
+			case PLPGSQL_DTYPE_PROMISE:
+				outdatum = (PLpgSQL_datum *) ws_next;
+				memcpy(outdatum, indatum, sizeof(PLpgSQL_var));
+				ws_next += MAXALIGN(sizeof(PLpgSQL_var));
+				break;
+
+			case PLPGSQL_DTYPE_REC:
+				outdatum = (PLpgSQL_datum *) ws_next;
+				memcpy(outdatum, indatum, sizeof(PLpgSQL_rec));
+				ws_next += MAXALIGN(sizeof(PLpgSQL_rec));
+				break;
+
+			case PLPGSQL_DTYPE_ROW:
+			case PLPGSQL_DTYPE_RECFIELD:
+
+				/*
+				 * These datum records are read-only at runtime, so no need to
+				 * copy them (well, RECFIELD contains cached data, but we'd
+				 * just as soon centralize the caching anyway).
+				 */
+				outdatum = indatum;
+				break;
+
+			default:
+				elog(ERROR, "unrecognized dtype: %d", indatum->dtype);
+				outdatum = NULL;	/* keep compiler quiet */
+				break;
+		}
+
+		outdatums[i] = outdatum;
+	}
+
+	Assert(ws_next == workspace + func->copiable_size);
+}
+
+/*
+ * plpgsql_parser_setup		set up parser hooks for dynamic parameters
+ *
+ * Note: this routine, and the hook functions it prepares for, are executed during
+ * plpgsql analyzing.
+ */
+static void
+plpgsql_analyzer_setup(struct ParseState *pstate, PLpgSQL_expr *expr)
+{
+	plpgsql_parser_setup(pstate, expr);
+}
+
+static List*
+sql_parse_and_analyze(PLpgSQL_function* fn, PLpgSQL_expr* expr)
+{
+	List		*raw_parsetree_list;
+	ListCell   	*list_item;
+	ParserSetupHook hook;
+	List 		*qrylist = NIL;
+
+	raw_parsetree_list = raw_parser(expr->query, expr->parseMode);
+
+	/* VERY IMPORTANT setup otherwise resulting a confuzed core dump */
+	expr->func = fn;
+
+	hook = (ParserSetupHook)plpgsql_analyzer_setup;
+	foreach(list_item, raw_parsetree_list)
+	{
+		RawStmt    *parsetree = lfirst_node(RawStmt, list_item);
+		Query* qry = parse_analyze_withcb(parsetree, expr->query, hook, expr,
+								   NULL);
+		qrylist = lappend(qrylist, qry);
+	}
+
+	return qrylist;
+}
+
+static void
+plpgsql_analyze_function(PLpgSQL_function *func, FunctionCallInfo fcinfo)
+{
+	/*
+	 * Why use PLpgSQL_execstate here?
+	 * Because I want to reuse a lot code in pl_exec.c
+	 */
+	PLpgSQL_execstate estate;
+	ErrorContextCallback plerrcontext;
+
+	/*
+	 * Setup the execution state
+	 */
+	plpgsql_estate_prepare(&estate, func, (ReturnSetInfo *) fcinfo->resultinfo);
+	/*
+	 * Setup error traceback support for ereport()
+	 */
+	plerrcontext.callback = plpgsql_compile_error_callback;
+	plerrcontext.arg = &estate;
+	plerrcontext.previous = error_context_stack;
+	error_context_stack = &plerrcontext;
+
+	/*
+	 * Make local execution copies of all the datums
+	 */
+	estate.err_text = gettext_noop("during initialization of analyzing state");
+	copy_plpgsql_datums(&estate, func);
+
+	analyze_toplevel_block(func, plpgsql_parse_result);
+}
+/* --} end of analyzing */
 
 /*
  * This is the slow part of plpgsql_compile().
@@ -826,6 +1622,14 @@ do_compile(FunctionCallInfo fcinfo,
 
 	MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
 	plpgsql_compile_tmp_cxt = NULL;
+
+
+	/* with completed functions, we can analyze the function bodies now */
+	if (analyze_function_bodies)
+	{
+		plpgsql_analyze_function(function, fcinfo);
+	}
+
 	return function;
 }
 
