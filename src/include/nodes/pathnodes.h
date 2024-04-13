@@ -2383,6 +2383,7 @@ typedef struct LimitPath
 	Path	   *subpath;		/* path representing input source */
 	Node	   *limitOffset;	/* OFFSET parameter, or NULL if none */
 	Node	   *limitCount;		/* COUNT parameter, or NULL if none */
+	Node	   *limitPerNth;	/* PERNTH parameter, or NULL if none */
 	LimitOption limitOption;	/* FETCH FIRST with ties or exact number */
 } LimitPath;
 

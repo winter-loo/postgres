@@ -1275,6 +1275,9 @@ typedef struct Limit
 	/* COUNT parameter, or NULL if none */
 	Node	   *limitCount;
 
+	/* PERNTH parameter, or NULL if none */
+	Node	   *limitPerNth;
+
 	/* limit type */
 	LimitOption limitOption;
 

@@ -2571,6 +2571,7 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 		plan = (Plan *) make_limit(plan,
 								   subparse->limitOffset,
 								   subparse->limitCount,
+								   subparse->limitPerNth,
 								   subparse->limitOption,
 								   0, NULL, NULL, NULL);
 
@@ -2889,6 +2890,7 @@ create_limit_plan(PlannerInfo *root, LimitPath *best_path, int flags)
 	plan = make_limit(subplan,
 					  best_path->limitOffset,
 					  best_path->limitCount,
+					  best_path->limitPerNth,
 					  best_path->limitOption,
 					  numUniqkeys, uniqColIdx, uniqOperators, uniqCollations);
 
@@ -6956,8 +6958,8 @@ make_lockrows(Plan *lefttree, List *rowMarks, int epqParam)
  */
 Limit *
 make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
-		   LimitOption limitOption, int uniqNumCols, AttrNumber *uniqColIdx,
-		   Oid *uniqOperators, Oid *uniqCollations)
+		   Node *limitPerNth, LimitOption limitOption, int uniqNumCols,
+		   AttrNumber *uniqColIdx, Oid *uniqOperators, Oid *uniqCollations)
 {
 	Limit	   *node = makeNode(Limit);
 	Plan	   *plan = &node->plan;
@@ -6969,6 +6971,7 @@ make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
 
 	node->limitOffset = limitOffset;
 	node->limitCount = limitCount;
+	node->limitPerNth = limitPerNth;
 	node->limitOption = limitOption;
 	node->uniqNumCols = uniqNumCols;
 	node->uniqColIdx = uniqColIdx;

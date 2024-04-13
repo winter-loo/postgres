@@ -1308,7 +1308,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	ListCell   *lc;
 
 	/* Tweak caller-supplied tuple_fraction if have LIMIT/OFFSET */
-	if (parse->limitCount || parse->limitOffset)
+	if (parse->limitCount || parse->limitOffset || parse->limitPerNth)
 	{
 		tuple_fraction = preprocess_limit(root, tuple_fraction,
 										  &offset_est, &count_est);
@@ -1790,6 +1790,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 			path = (Path *) create_limit_path(root, final_rel, path,
 											  parse->limitOffset,
 											  parse->limitCount,
+											  parse->limitPerNth,
 											  parse->limitOption,
 											  offset_est, count_est);
 		}
@@ -2434,7 +2435,7 @@ preprocess_limit(PlannerInfo *root, double tuple_fraction,
 	double		limit_fraction;
 
 	/* Should not be called unless LIMIT or OFFSET */
-	Assert(parse->limitCount || parse->limitOffset);
+	Assert(parse->limitCount || parse->limitOffset || parse->limitPerNth);
 
 	/*
 	 * Try to obtain the clause values.  We use estimate_expression_value
@@ -2443,6 +2444,26 @@ preprocess_limit(PlannerInfo *root, double tuple_fraction,
 	if (parse->limitCount)
 	{
 		est = estimate_expression_value(root, parse->limitCount);
+		if (est && IsA(est, Const))
+		{
+			if (((Const *) est)->constisnull)
+			{
+				/* NULL indicates LIMIT ALL, ie, no limit */
+				*count_est = 0; /* treat as not present */
+			}
+			else
+			{
+				*count_est = DatumGetInt64(((Const *) est)->constvalue);
+				if (*count_est <= 0)
+					*count_est = 1; /* force to at least 1 */
+			}
+		}
+		else
+			*count_est = -1;	/* can't estimate */
+	}
+	else if (parse->limitPerNth)
+	{
+		est = estimate_expression_value(root, parse->limitPerNth);
 		if (est && IsA(est, Const))
 		{
 			if (((Const *) est)->constisnull)
@@ -2628,6 +2649,19 @@ limit_needed(Query *parse)
 			return true;		/* non-constant LIMIT */
 	}
 
+	node = parse->limitPerNth;
+	if (node)
+	{
+		if (IsA(node, Const))
+		{
+			/* NULL indicates LIMIT ALL, ie, no limit */
+			if (!((Const *) node)->constisnull)
+				return true;	/* LIMIT with a constant value */
+		}
+		else
+			return true;		/* non-constant LIMIT */
+	}
+	
 	node = parse->limitOffset;
 	if (node)
 	{
@@ -4807,6 +4841,7 @@ create_partial_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 												   sorted_path,
 												   NULL,
 												   limitCount,
+												   NULL,
 												   LIMIT_OPTION_COUNT,
 												   0, 1));
 			}
@@ -5020,6 +5055,7 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 				add_path(distinct_rel, (Path *)
 						 create_limit_path(root, distinct_rel, sorted_path,
 										   NULL, limitCount,
+										   NULL,
 										   LIMIT_OPTION_COUNT, 0, 1));
 			}
 			else

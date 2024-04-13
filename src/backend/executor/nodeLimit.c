@@ -113,7 +113,10 @@ ExecLimit(PlanState *pstate)
 					ExecCopySlot(node->last_slot, slot);
 				}
 				node->subSlot = slot;
-				if (++node->position > node->offset)
+				++node->position;
+				if (node->limitOption == LIMIT_OPTION_PER_NTH && node->position % node->pernth == 0)
+					break;
+				else if (node->limitOption != LIMIT_OPTION_PER_NTH && node->position > node->offset)
 					break;
 			}
 
@@ -163,6 +166,28 @@ ExecLimit(PlanState *pstate)
 						node->lstate = LIMIT_WINDOWEND_TIES;
 						/* we'll fall through to the next case */
 					}
+				}
+				else if (node->limitOption == LIMIT_OPTION_PER_NTH)
+				{
+					/*
+					 * If we are in per nth mode, we need to skip tuples until
+					 * we reach the next tuple that should be returned.
+					 */
+					for (;;)
+					{
+						slot = ExecProcNode(outerPlan);
+						if (TupIsNull(slot))
+						{
+							node->lstate = LIMIT_SUBPLANEOF;
+							return NULL;
+						}
+
+						node->subSlot = slot;
+						++node->position;
+						if (node->position % node->pernth == 0)
+							break;
+					}
+					break;
 				}
 				else
 				{
@@ -370,7 +395,7 @@ recompute_limits(LimitState *node)
 			if (node->offset < 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE),
-						 errmsg("OFFSET must not be negative")));
+						 errmsg("OFFSET must not be less than 1")));
 		}
 	}
 	else
@@ -405,6 +430,31 @@ recompute_limits(LimitState *node)
 		/* No COUNT supplied */
 		node->count = 0;
 		node->noCount = true;
+	}
+
+	if (node->limitPerNth)
+	{
+		val = ExecEvalExprSwitchContext(node->limitPerNth,
+										econtext,
+										&isNull);
+		/* Interpret NULL count as no count (LIMIT ALL) */
+		if (isNull)
+		{
+			node->pernth = 1;
+		}
+		else
+		{
+			node->pernth = DatumGetInt64(val);
+			if (node->pernth < 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),
+						 errmsg("LIMIT must not be negative")));
+		}
+	}
+	else
+	{
+		/* No PERNTH supplied */
+		node->pernth = 1;
 	}
 
 	/* Reset position to start-of-scan */
@@ -482,6 +532,8 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 	limitstate->limitOffset = ExecInitExpr((Expr *) node->limitOffset,
 										   (PlanState *) limitstate);
 	limitstate->limitCount = ExecInitExpr((Expr *) node->limitCount,
+										  (PlanState *) limitstate);
+	limitstate->limitPerNth = ExecInitExpr((Expr *) node->limitPerNth,
 										  (PlanState *) limitstate);
 	limitstate->limitOption = node->limitOption;
 

@@ -3820,6 +3820,7 @@ LimitPath *
 create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 				  Path *subpath,
 				  Node *limitOffset, Node *limitCount,
+				  Node* limitPerNth,
 				  LimitOption limitOption,
 				  int64 offset_est, int64 count_est)
 {
@@ -3842,6 +3843,7 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->subpath = subpath;
 	pathnode->limitOffset = limitOffset;
 	pathnode->limitCount = limitCount;
+	pathnode->limitPerNth = limitPerNth;
 	pathnode->limitOption = limitOption;
 
 	/*

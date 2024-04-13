@@ -1434,6 +1434,9 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	qry->limitCount = transformLimitClause(pstate, stmt->limitCount,
 										   EXPR_KIND_LIMIT, "LIMIT",
 										   stmt->limitOption);
+	qry->limitPerNth = transformLimitClause(pstate, stmt->limitPerNth,
+										   EXPR_KIND_LIMIT, "LIMIT",
+										   stmt->limitOption);
 	qry->limitOption = stmt->limitOption;
 
 	/* transform window clauses after we have seen all window functions */

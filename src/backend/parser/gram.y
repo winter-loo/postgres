@@ -128,6 +128,7 @@ typedef struct SelectLimit
 {
 	Node	   *limitOffset;
 	Node	   *limitCount;
+	Node	   *limitPerNth;
 	LimitOption limitOption;
 } SelectLimit;
 
@@ -756,7 +757,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
 	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD
-	PERIOD PLACING PLANS POLICY
+	PER PERIOD PLACING PLANS POLICY
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
 
@@ -13109,6 +13110,7 @@ limit_clause:
 
 					n->limitOffset = NULL;
 					n->limitCount = $2;
+					n->limitPerNth = NULL;
 					n->limitOption = LIMIT_OPTION_COUNT;
 					$$ = n;
 				}
@@ -13134,6 +13136,7 @@ limit_clause:
 
 					n->limitOffset = NULL;
 					n->limitCount = $3;
+					n->limitPerNth = NULL;
 					n->limitOption = LIMIT_OPTION_COUNT;
 					$$ = n;
 				}
@@ -13143,6 +13146,7 @@ limit_clause:
 
 					n->limitOffset = NULL;
 					n->limitCount = $3;
+					n->limitPerNth = NULL;
 					n->limitOption = LIMIT_OPTION_WITH_TIES;
 					$$ = n;
 				}
@@ -13152,6 +13156,7 @@ limit_clause:
 
 					n->limitOffset = NULL;
 					n->limitCount = makeIntConst(1, -1);
+					n->limitPerNth = NULL;
 					n->limitOption = LIMIT_OPTION_COUNT;
 					$$ = n;
 				}
@@ -13161,7 +13166,17 @@ limit_clause:
 
 					n->limitOffset = NULL;
 					n->limitCount = makeIntConst(1, -1);
+					n->limitPerNth = NULL;
 					n->limitOption = LIMIT_OPTION_WITH_TIES;
+					$$ = n;
+				}
+			| FETCH PER select_fetch_first_value row_or_rows
+				{
+					SelectLimit *n = (SelectLimit *) palloc(sizeof(SelectLimit));
+					n->limitOffset = NULL;
+					n->limitCount = NULL;
+					n->limitPerNth = $3;
+					n->limitOption = LIMIT_OPTION_PER_NTH;
 					$$ = n;
 				}
 		;
@@ -17512,6 +17527,7 @@ unreserved_keyword:
 			| PARTITION
 			| PASSING
 			| PASSWORD
+			| PER
 			| PERIOD
 			| PLANS
 			| POLICY
@@ -18130,6 +18146,7 @@ bare_label_keyword:
 			| PARTITION
 			| PASSING
 			| PASSWORD
+			| PER
 			| PERIOD
 			| PLACING
 			| PLANS
@@ -18690,6 +18707,15 @@ insertSelectOptions(SelectStmt *stmt,
 					 errmsg("multiple LIMIT clauses not allowed"),
 					 parser_errposition(exprLocation(limitClause->limitCount))));
 		stmt->limitCount = limitClause->limitCount;
+	}
+	if (limitClause && limitClause->limitPerNth)
+	{
+		if (stmt->limitPerNth)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("multiple LIMIT clauses not allowed"),
+					 parser_errposition(exprLocation(limitClause->limitPerNth))));
+		stmt->limitPerNth = limitClause->limitPerNth;
 	}
 	if (limitClause)
 	{
