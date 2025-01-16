@@ -1202,6 +1202,7 @@ ProcessUtilitySlow(ParseState *pstate,
 
 							NewRelationCreateToastTable(address.objectId,
 														toast_options);
+							NewRelationCreateItimeTable(address.objectId);
 						}
 						else if (IsA(stmt, CreateForeignTableStmt))
 						{

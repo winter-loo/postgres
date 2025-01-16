@@ -757,7 +757,7 @@ heap_getsysattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 			result = ObjectIdGetDatum(tup->t_tableOid);
 			break;
 		case InsertTimeAttributeNumber:
-			result = 0;
+			result = heap_itime_getitime(ObjectIdGetDatum(tup->t_tableOid), tup);
 			break;
 		default:
 			elog(ERROR, "invalid attnum: %d", attnum);

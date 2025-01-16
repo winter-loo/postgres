@@ -1769,6 +1769,7 @@ typedef struct TidScanState
 	ScanState	ss;				/* its first field is NodeTag */
 	List	   *tss_tidexprs;
 	bool		tss_isCurrentOf;
+	bool		tss_mappedCtid;
 	int			tss_NumTids;
 	int			tss_TidPtr;
 	ItemPointerData *tss_TidList;

@@ -31,6 +31,10 @@
 #include "access/toast_helper.h"
 #include "access/toast_internals.h"
 #include "utils/fmgroids.h"
+#include "utils/timestamp.h"
+#include "catalog/toasting.h"
+#include "catalog/index.h"
+#include "executor/tuptable.h"
 
 
 /* ----------
@@ -73,6 +77,223 @@ heap_toast_delete(Relation rel, HeapTuple oldtup, bool is_speculative)
 	toast_delete_external(rel, toast_values, toast_isnull, is_speculative);
 }
 
+static inline uint64
+ItemPointerToU64(ItemPointer itemptr)
+{
+	uint32 a = (itemptr->ip_blkid.bi_hi << 16) | itemptr->ip_blkid.bi_lo;
+	return (a << 16) | itemptr->ip_posid;
+}
+
+static inline ItemPointerData
+U64ToItemPointer(uint64 u)
+{
+	ItemPointerData ctid;
+	ctid.ip_posid = u & 0xffff;
+	ctid.ip_blkid.bi_lo = (u >> 16) & 0xffff;
+	ctid.ip_blkid.bi_hi = (u >> 32) & 0xffff;
+	return ctid;
+}
+
+void
+heap_itime_delete(Relation rel, HeapTuple tp)
+{
+	Relation itimerel;
+	List	   *indexlist;
+	ListCell   *lc;
+	char		itime_idxname_ctid[NAMEDATALEN];
+	char	   *index_name;
+	Relation	itimeidxrel;
+
+	Assert(tp != NULL);
+
+	if (!OidIsValid(rel->rd_rel->relitimerelid))
+		return;
+
+	itimerel = table_open(rel->rd_rel->relitimerelid, RowExclusiveLock);
+
+	indexlist = RelationGetIndexList(itimerel);
+	Assert(indexlist != NIL);
+
+	/* see create_itime_table */
+	Assert(list_length(indexlist) == 2);
+
+	snprintf(itime_idxname_ctid, sizeof(itime_idxname_ctid),
+		ITIME_INDEX_CTID_PREFIX "%u", rel->rd_id);
+
+	foreach(lc, indexlist)
+	{
+		itimeidxrel = index_open(lfirst_oid(lc), RowExclusiveLock);
+		index_name = NameStr(itimeidxrel->rd_rel->relname);
+
+		/* delete from pg_itime_xxx where ctid_ = $1 */
+		if (strcmp(index_name, itime_idxname_ctid) == 0)
+		{
+			ScanKeyData ctidkey;
+			SysScanDesc ctidscan;
+			ItemPointer tid = &tp->t_self;
+			HeapTuple itime_oldtup;
+
+			ScanKeyInit(&ctidkey,
+						(AttrNumber) Anum_pg_itime_xxx_ctid,
+						BTEqualStrategyNumber, F_INT8EQ,
+						UInt8GetDatum(ItemPointerToU64(tid)));
+
+			ctidscan = systable_beginscan_ordered(itimerel, itimeidxrel,
+									NULL, 1, &ctidkey);
+			itime_oldtup = systable_getnext_ordered(ctidscan, ForwardScanDirection);
+			if (!HeapTupleIsValid(itime_oldtup))
+				elog(ERROR, "could not find tuple for ctid entry for relation %s",
+						index_name);
+			simple_heap_delete(itimerel, &itime_oldtup->t_self);
+			systable_endscan_ordered(ctidscan);
+		}
+		index_close(itimeidxrel, NoLock);
+	}
+	list_free(indexlist);
+	table_close(itimerel, NoLock);
+}
+
+Datum
+heap_itime_getitime(Oid relid, HeapTuple tp)
+{
+	Relation parentrel;
+	Relation itimerel;
+	List	   *indexlist;
+	ListCell   *lc;
+	char		itime_idxname_ctid[NAMEDATALEN];
+	char	   *index_name;
+	Relation	itimeidxrel;
+	Oid			itimerelid;
+	Datum		values[2];
+	bool		nulls[2];
+	Datum		result;
+
+	Assert(tp != NULL);
+
+	parentrel = table_open(relid, AccessShareLock);
+	itimerelid = parentrel->rd_rel->relitimerelid;
+
+	if (!OidIsValid(itimerelid))
+		return 0;
+
+	itimerel = table_open(itimerelid, AccessShareLock);
+
+	indexlist = RelationGetIndexList(itimerel);
+	Assert(indexlist != NIL);
+
+	/* see create_itime_table */
+	Assert(list_length(indexlist) == 2);
+
+	snprintf(itime_idxname_ctid, sizeof(itime_idxname_ctid),
+		ITIME_INDEX_CTID_PREFIX "%u", relid);
+
+	foreach(lc, indexlist)
+	{
+		itimeidxrel = index_open(lfirst_oid(lc), AccessShareLock);
+		index_name = NameStr(itimeidxrel->rd_rel->relname);
+
+		/* select itime_ from pg_itime_xxx where ctid_ = $1 */
+		if (strcmp(index_name, itime_idxname_ctid) == 0)
+		{
+			ScanKeyData ctidkey;
+			SysScanDesc ctidscan;
+			ItemPointer tid = &tp->t_self;
+			HeapTuple itime_oldtup;
+
+			ScanKeyInit(&ctidkey,
+						(AttrNumber) Anum_pg_itime_xxx_ctid,
+						BTEqualStrategyNumber, F_INT8EQ,
+						UInt8GetDatum(ItemPointerToU64(tid)));
+
+			ctidscan = systable_beginscan_ordered(itimerel, itimeidxrel,
+									NULL, 1, &ctidkey);
+			itime_oldtup = systable_getnext_ordered(ctidscan, ForwardScanDirection);
+			if (!HeapTupleIsValid(itime_oldtup))
+				elog(ERROR, "could not find tuple for ctid entry for relation %s",
+						index_name);
+			heap_deform_tuple(itime_oldtup, itimerel->rd_att, values, nulls);
+			result = values[0];
+			systable_endscan_ordered(ctidscan);
+		}
+		index_close(itimeidxrel, NoLock);
+	}
+	list_free(indexlist);
+	table_close(itimerel, NoLock);
+	table_close(parentrel, NoLock);
+	return result;
+}
+
+ItemPointerData
+heap_itime_getctid(Oid relid, Datum itime)
+{
+	Relation parentrel;
+	Relation itimerel;
+	List	   *indexlist;
+	ListCell   *lc;
+	char		itime_idxname_itime[NAMEDATALEN];
+	char	   *index_name;
+	Relation	itimeidxrel;
+	Oid			itimerelid;
+	Datum		values[2];
+	bool		nulls[2];
+
+	Assert(tp != NULL);
+
+	parentrel = table_open(relid, AccessShareLock);
+	itimerelid = parentrel->rd_rel->relitimerelid;
+
+	if (!OidIsValid(itimerelid))
+	{
+		ItemPointerData result;
+		ItemPointerSetInvalid(&result);
+		return result;
+	}
+
+	itimerel = table_open(itimerelid, AccessShareLock);
+
+	indexlist = RelationGetIndexList(itimerel);
+	Assert(indexlist != NIL);
+
+	/* see create_itime_table */
+	Assert(list_length(indexlist) == 2);
+
+	snprintf(itime_idxname_itime, sizeof(itime_idxname_itime),
+		ITIME_INDEX_ITIME_PREFIX "%u", relid);
+
+	foreach(lc, indexlist)
+	{
+		itimeidxrel = index_open(lfirst_oid(lc), AccessShareLock);
+		index_name = NameStr(itimeidxrel->rd_rel->relname);
+
+		/* select itime_ from pg_itime_xxx where ctid_ = $1 */
+		if (strcmp(index_name, itime_idxname_itime) == 0)
+		{
+			ScanKeyData itimekey;
+			SysScanDesc itimescan;
+			HeapTuple itime_oldtup;
+
+			ScanKeyInit(&itimekey,
+						(AttrNumber) Anum_pg_itime_xxx_itime,
+						BTEqualStrategyNumber, F_INT8EQ,
+						itime);
+
+			itimescan = systable_beginscan_ordered(itimerel, itimeidxrel,
+									NULL, 1, &itimekey);
+			itime_oldtup = systable_getnext_ordered(itimescan, ForwardScanDirection);
+			if (!HeapTupleIsValid(itime_oldtup))
+				elog(ERROR, "could not find tuple for itime entry for relation %s",
+						index_name);
+			heap_deform_tuple(itime_oldtup, itimerel->rd_att, values, nulls);
+			systable_endscan_ordered(itimescan);
+		}
+		index_close(itimeidxrel, NoLock);
+	}
+	list_free(indexlist);
+	table_close(itimerel, NoLock);
+	table_close(parentrel, NoLock);
+
+	return U64ToItemPointer(DatumGetUInt64(values[1]));
+}
 
 /* ----------
  * heap_toast_insert_or_update -
@@ -333,6 +554,135 @@ heap_toast_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup,
 	toast_tuple_cleanup(&ttc);
 
 	return result_tuple;
+}
+
+void
+heap_itime_insert_or_update(Relation rel, HeapTuple newtup, HeapTuple oldtup, int options)
+{
+	Assert(rel != NULL);
+	Assert(newtup != NULL);
+
+	if (rel->rd_rel->relitimerelid != InvalidOid)
+	{
+		Relation	itimerel;
+		HeapTuple	itimetup;
+		TupleDesc	itimetupDesc;
+		Datum		t_values[2];
+		bool		t_isnull[2];
+		Datum		t_oldvalues[2];
+		bool		t_oldisnull[2];
+		CommandId	mycid = GetCurrentCommandId(true);
+		ItemPointer item_ptr = &(newtup->t_self);
+		Datum		old_itime = 0;
+		Relation    itimeidxrels[2];
+		IndexInfo  *indexInfos[2];
+		TupleTableSlot *slot;
+		Datum 		idx_values[1];
+		bool  		idx_nulls[1];
+		int			num_indexes;
+		int			i;
+
+		itimerel = table_open(rel->rd_rel->relitimerelid, RowExclusiveLock);
+		itimetupDesc = itimerel->rd_att;
+
+		{
+			List	   *indexlist;
+			ListCell   *lc;
+			char		itime_idxname_ctid[NAMEDATALEN];
+			char	   *index_name;
+			int 		k;
+
+			/* Get index list of the toast relation */
+			indexlist = RelationGetIndexList(itimerel);
+			Assert(indexlist != NIL);
+
+			/* see create_itime_table */
+			num_indexes = list_length(indexlist);
+			Assert(num_indexes == 2);
+
+			snprintf(itime_idxname_ctid, sizeof(itime_idxname_ctid),
+				ITIME_INDEX_CTID_PREFIX "%u", rel->rd_id);
+
+			k = 0;
+			foreach(lc, indexlist)
+			{
+				itimeidxrels[k] = index_open(lfirst_oid(lc), RowExclusiveLock);
+				indexInfos[k] = BuildIndexInfo(itimeidxrels[k]);
+				index_name = NameStr(itimeidxrels[k]->rd_rel->relname);
+
+				/* delete from pg_itime_xxx where ctid_ = $1 */
+				if (oldtup != NULL && strcmp(index_name, itime_idxname_ctid) == 0)
+				{
+					ScanKeyData ctidkey;
+					SysScanDesc ctidscan;
+					ItemPointer itemptr = &oldtup->t_self;
+					HeapTuple itime_oldtup;
+
+					ScanKeyInit(&ctidkey,
+								(AttrNumber) Anum_pg_itime_xxx_ctid,
+								BTEqualStrategyNumber, F_INT8EQ,
+								UInt8GetDatum(ItemPointerToU64(itemptr)));
+
+					ctidscan = systable_beginscan_ordered(itimerel, itimeidxrels[k],
+										   NULL, 1, &ctidkey);
+					itime_oldtup = systable_getnext_ordered(ctidscan, ForwardScanDirection);
+					if (!HeapTupleIsValid(itime_oldtup))
+						elog(ERROR, "could not find tuple for ctid entry for relation %s",
+							   index_name);
+					heap_deform_tuple(itime_oldtup, itimetupDesc, t_oldvalues, t_oldisnull);
+					old_itime = t_oldvalues[0];
+					simple_heap_delete(itimerel, &itime_oldtup->t_self);
+					systable_endscan_ordered(ctidscan);
+				}
+				k++;
+			}
+			list_free(indexlist);
+		}
+
+		/*
+		* Initialize constant parts of the tuple data
+		*/
+		t_values[0] = (old_itime != 0) ? old_itime : (Datum) GetCurrentTimestamp();
+		t_values[1] = (Datum) ItemPointerToU64(item_ptr);
+		t_isnull[0] = false;
+		t_isnull[1] = false;
+
+		/*
+		* Build a tuple and store it
+		*/
+		itimetup = heap_form_tuple(itimetupDesc, t_values, t_isnull);
+
+		heap_insert(itimerel, itimetup, mycid, options, NULL);
+
+		slot = MakeSingleTupleTableSlot(RelationGetDescr(itimerel), &TTSOpsHeapTuple);
+		ExecStoreHeapTuple(itimetup, slot, false);
+
+		for (i = 0; i < num_indexes; i++)
+		{
+			FormIndexDatum(indexInfos[i], slot, NULL, idx_values, idx_nulls);
+			index_insert(itimeidxrels[i], idx_values, idx_nulls,
+						&(itimetup->t_self),
+						itimerel,
+						UNIQUE_CHECK_YES,
+						false, NULL);
+
+			index_close(itimeidxrels[i], NoLock);
+		}
+
+		ExecDropSingleTupleTableSlot(slot);
+
+		/*
+		* Free memory
+		*/
+		heap_freetuple(itimetup);
+
+		/*
+		* Done - close toast relation and its indexes but keep the lock until
+		* commit, so as a concurrent reindex done directly on the toast relation
+		* would be able to wait for this transaction.
+		*/
+		table_close(itimerel, NoLock);
+	}
 }
 
 

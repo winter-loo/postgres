@@ -96,7 +96,8 @@
  */
 extern HeapTuple heap_toast_insert_or_update(Relation rel, HeapTuple newtup,
 											 HeapTuple oldtup, int options);
-
+extern void heap_itime_insert_or_update(Relation rel, HeapTuple newtup,
+									   HeapTuple oldtup, int options);
 /* ----------
  * heap_toast_delete -
  *
@@ -105,6 +106,9 @@ extern HeapTuple heap_toast_insert_or_update(Relation rel, HeapTuple newtup,
  */
 extern void heap_toast_delete(Relation rel, HeapTuple oldtup,
 							  bool is_speculative);
+extern void heap_itime_delete(Relation rel, HeapTuple tp);
+extern Datum heap_itime_getitime(Oid relid, HeapTuple tp);
+extern ItemPointerData heap_itime_getctid(Oid relid, Datum itime);
 
 /* ----------
  * toast_flatten_tuple -

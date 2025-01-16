@@ -38,7 +38,9 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "access/table.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "nodes/nodeFuncs.h"
@@ -47,6 +49,50 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "utils/syscache.h"
+
+static bool
+IsEqOperator(Oid oprOid)
+{
+	Relation	relation;
+	HeapTuple	tup;
+	Form_pg_operator op;
+	bool result;
+
+	relation = table_open(OperatorRelationId, AccessShareLock);
+
+	tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(oprOid));
+	if (!HeapTupleIsValid(tup)) /* should not happen */
+		elog(ERROR, "cache lookup failed for operator %u", oprOid);
+	op = (Form_pg_operator) GETSTRUCT(tup);
+	result =  strcmp(NameStr(op->oprname), "=") == 0;
+	ReleaseSysCache(tup);
+	table_close(relation, AccessShareLock);
+	return result;
+}
+
+static bool
+IsRangeCmpOperator(Oid oprOid)
+{
+	Relation	relation;
+	HeapTuple	tup;
+	Form_pg_operator op;
+	bool result;
+
+	relation = table_open(OperatorRelationId, AccessShareLock);
+
+	tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(oprOid));
+	if (!HeapTupleIsValid(tup)) /* should not happen */
+		elog(ERROR, "cache lookup failed for operator %u", oprOid);
+	op = (Form_pg_operator) GETSTRUCT(tup);
+	result =  strcmp(NameStr(op->oprname), "<=") == 0 ||
+		   strcmp(NameStr(op->oprname), ">=") == 0 ||
+		   strcmp(NameStr(op->oprname), "<") == 0 ||
+		   strcmp(NameStr(op->oprname), ">") == 0;
+	ReleaseSysCache(tup);
+	table_close(relation, AccessShareLock);
+	return result;
+}
 
 
 /*
@@ -58,6 +104,12 @@ IsCTIDVar(Var *var, RelOptInfo *rel)
 	/* The vartype check is strictly paranoia */
 	if (var->varattno == SelfItemPointerAttributeNumber &&
 		var->vartype == TIDOID &&
+		var->varno == rel->relid &&
+		var->varnullingrels == NULL &&
+		var->varlevelsup == 0)
+		return true;
+	if (var->varattno == InsertTimeAttributeNumber &&
+		var->vartype == INT8OID &&
 		var->varno == rel->relid &&
 		var->varnullingrels == NULL &&
 		var->varlevelsup == 0)
@@ -136,6 +188,9 @@ IsTidEqualClause(RestrictInfo *rinfo, RelOptInfo *rel)
 	if (((OpExpr *) rinfo->clause)->opno == TIDEqualOperator)
 		return true;
 
+	if (IsEqOperator(((OpExpr *) rinfo->clause)->opno))
+		return true;
+
 	return false;
 }
 
@@ -158,6 +213,9 @@ IsTidRangeClause(RestrictInfo *rinfo, RelOptInfo *rel)
 
 	if (opno == TIDLessOperator || opno == TIDLessEqOperator ||
 		opno == TIDGreaterOperator || opno == TIDGreaterEqOperator)
+		return true;
+
+	if (IsRangeCmpOperator(opno))
 		return true;
 
 	return false;
@@ -183,6 +241,8 @@ IsTidEqualAnyClause(PlannerInfo *root, RestrictInfo *rinfo, RelOptInfo *rel)
 
 	/* Operator must be tideq */
 	if (node->opno != TIDEqualOperator)
+		return false;
+	if (!IsEqOperator(node->opno))
 		return false;
 	if (!node->useOr)
 		return false;

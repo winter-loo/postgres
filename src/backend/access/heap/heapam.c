@@ -2004,6 +2004,8 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 
+	heap_itime_insert_or_update(relation, heaptup, NULL, 0);
+
 	/*
 	 * If tuple is cachable, mark it for invalidation from the caches in case
 	 * we abort.  Note it is OK to do this after releasing the buffer, because
@@ -2905,6 +2907,8 @@ l1:
 
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
+
+	heap_itime_delete(relation, &tp);
 
 	/*
 	 * If the tuple has toasted out-of-line attributes, we need to delete
@@ -3862,6 +3866,8 @@ l2:
 	if (newbuf != buffer)
 		LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+	heap_itime_insert_or_update(relation, newtup, &oldtup, 0);
 
 	/*
 	 * Mark old tuple for invalidation from system caches at next command

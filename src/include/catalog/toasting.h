@@ -16,6 +16,15 @@
 
 #include "storage/lock.h"
 
+#define ITIME_TABLE_NAME_PREFIX "pg_itime_"
+#define ITIME_INDEX_ITIME_PREFIX "pg_itime_index_itime_"
+#define ITIME_INDEX_CTID_PREFIX "pg_itime_index_ctid_"
+#define Aname_pg_itime_xxx_itime "itime_"
+#define Aname_pg_itime_xxx_ctid "ctid_"
+#define Anum_pg_itime_xxx_itime 	1
+#define Anum_pg_itime_xxx_ctid 	2
+
+
 /*
  * toasting.c prototypes
  */
@@ -26,5 +35,7 @@ extern void AlterTableCreateToastTable(Oid relOid, Datum reloptions,
 									   LOCKMODE lockmode);
 extern void BootstrapToastTable(char *relName,
 								Oid toastOid, Oid toastIndexOid);
+
+extern void NewRelationCreateItimeTable(Oid relOid);
 
 #endif							/* TOASTING_H */

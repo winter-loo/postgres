@@ -22,6 +22,7 @@
  */
 #include "postgres.h"
 
+#include "access/heaptoast.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
@@ -41,10 +42,14 @@
  * parameterized scan referencing some other table's CTID, the other table's
  * Var would have become a Param by the time it gets here.)
  */
+#define IsMappedCTIDVar(node) \
+	 (((Var *) (node))->varattno == InsertTimeAttributeNumber)
+
 #define IsCTIDVar(node)  \
 	((node) != NULL && \
 	 IsA((node), Var) && \
-	 ((Var *) (node))->varattno == SelfItemPointerAttributeNumber)
+	 ((((Var *) (node))->varattno == SelfItemPointerAttributeNumber) || \
+	 (IsMappedCTIDVar(node))))
 
 /* one element in tss_tidexprs */
 typedef struct TidExpr
@@ -89,11 +94,15 @@ TidExprListCreate(TidScanState *tidstate)
 			arg1 = get_leftop(expr);
 			arg2 = get_rightop(expr);
 			if (IsCTIDVar(arg1))
-				tidexpr->exprstate = ExecInitExpr((Expr *) arg2,
-												  &tidstate->ss.ps);
+			{
+				tidstate->tss_mappedCtid = IsMappedCTIDVar(arg1);
+				tidexpr->exprstate = ExecInitExpr((Expr *) arg2, &tidstate->ss.ps);
+			}
 			else if (IsCTIDVar(arg2))
-				tidexpr->exprstate = ExecInitExpr((Expr *) arg1,
-												  &tidstate->ss.ps);
+			{
+				tidstate->tss_mappedCtid = IsMappedCTIDVar(arg2);
+				tidexpr->exprstate = ExecInitExpr((Expr *) arg1, &tidstate->ss.ps);
+			}
 			else
 				elog(ERROR, "could not identify CTID variable");
 			tidexpr->isarray = false;
@@ -166,16 +175,23 @@ TidListEval(TidScanState *tidstate)
 	{
 		TidExpr    *tidexpr = (TidExpr *) lfirst(l);
 		ItemPointer itemptr;
+		ItemPointerData ctid;
 		bool		isNull;
+		Datum		value;
 
 		if (tidexpr->exprstate && !tidexpr->isarray)
 		{
-			itemptr = (ItemPointer)
-				DatumGetPointer(ExecEvalExprSwitchContext(tidexpr->exprstate,
-														  econtext,
-														  &isNull));
+			value = ExecEvalExprSwitchContext(tidexpr->exprstate, econtext, &isNull);
 			if (isNull)
 				continue;
+
+			if (tidstate->tss_mappedCtid)
+			{
+				ctid = heap_itime_getctid(scan->rs_rd->rd_id, value);
+				itemptr = &ctid;
+			}
+			else
+				itemptr = (ItemPointer) DatumGetPointer(value);
 
 			/*
 			 * We silently discard any TIDs that the AM considers invalid

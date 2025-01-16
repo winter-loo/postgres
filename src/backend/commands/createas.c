@@ -133,6 +133,7 @@ create_ctas_internal(List *attrList, IntoClause *into)
 	(void) heap_reloptions(RELKIND_TOASTVALUE, toast_options, true);
 
 	NewRelationCreateToastTable(intoRelationAddr.objectId, toast_options);
+	NewRelationCreateItimeTable(intoRelationAddr.objectId);
 
 	/* Create the "view" part of a materialized view. */
 	if (is_matview)

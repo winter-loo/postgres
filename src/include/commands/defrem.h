@@ -79,6 +79,8 @@ extern void interpret_function_parameter_list(ParseState *pstate,
 extern ObjectAddress DefineOperator(List *names, List *parameters);
 extern void RemoveOperatorById(Oid operOid);
 extern ObjectAddress AlterOperator(AlterOperatorStmt *stmt);
+extern bool IsEqOperator(Oid oprId);
+extern bool IsRangeCmpOperator(Oid oprId);
 
 /* commands/statscmds.c */
 extern ObjectAddress CreateStatistics(CreateStatsStmt *stmt);

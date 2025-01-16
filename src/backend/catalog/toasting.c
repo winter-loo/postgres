@@ -44,6 +44,7 @@ static bool create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 							   Datum reloptions, LOCKMODE lockmode, bool check,
 							   Oid OIDOldToast);
 static bool needs_toast_table(Relation rel);
+static void create_itime_table(Relation rel);
 
 
 /*
@@ -76,6 +77,18 @@ NewRelationCreateToastTable(Oid relOid, Datum reloptions)
 {
 	CheckAndCreateToastTable(relOid, reloptions, AccessExclusiveLock, false,
 							 InvalidOid);
+}
+
+void
+NewRelationCreateItimeTable(Oid relOid)
+{
+	Relation rel;
+
+	rel = table_open(relOid, AccessExclusiveLock);
+
+	create_itime_table(rel);
+
+	table_close(rel, NoLock);
 }
 
 static void
@@ -397,6 +410,250 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	CommandCounterIncrement();
 
 	return true;
+}
+
+static void
+create_itime_table(Relation rel)
+{
+	Oid			relOid = RelationGetRelid(rel);
+	HeapTuple	reltup;
+	TupleDesc	tupdesc;
+	bool		shared_relation;
+	bool		mapped_relation;
+	Relation	itime_rel;
+	Relation	class_rel;
+	Oid			itime_relid;
+	Oid			namespaceid;
+	char		itime_relname[NAMEDATALEN];
+	char		itime_idxname_itime[NAMEDATALEN];
+	char		itime_idxname_ctid[NAMEDATALEN];
+	IndexInfo  *indexInfo;
+	Oid			collationObjectId[2];
+	Oid			classObjectId[2];
+	int16		coloptions[2];
+	ObjectAddress baseobject,
+				myobject;
+
+	if (rel->rd_rel->relitimerelid != InvalidOid)
+		return;
+
+	/*
+	 * Create the toast table and its index
+	 */
+	snprintf(itime_relname, sizeof(itime_relname),
+			 ITIME_TABLE_NAME_PREFIX "%u", relOid);
+	snprintf(itime_idxname_itime, sizeof(itime_idxname_itime),
+			 ITIME_INDEX_ITIME_PREFIX "%u", relOid);
+	snprintf(itime_idxname_ctid, sizeof(itime_idxname_ctid),
+			 ITIME_INDEX_CTID_PREFIX "%u", relOid);
+
+	/* this is pretty painful...  need a tuple descriptor */
+	tupdesc = CreateTemplateTupleDesc(2);
+	TupleDescInitEntry(tupdesc, (AttrNumber) Anum_pg_itime_xxx_itime,
+					   Aname_pg_itime_xxx_itime,
+					   INT8OID,
+					   -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) Anum_pg_itime_xxx_ctid,
+					   Aname_pg_itime_xxx_ctid,
+					   INT8OID,
+					   -1, 0);
+
+	/*
+	 * Ensure that the toast table doesn't itself get toasted, or we'll be
+	 * toast :-(.  This is essential for chunk_data because type bytea is
+	 * toastable; hit the other two just to be sure.
+	 */
+	TupleDescAttr(tupdesc, 0)->attstorage = TYPSTORAGE_PLAIN;
+	TupleDescAttr(tupdesc, 1)->attstorage = TYPSTORAGE_PLAIN;
+
+	/* Toast field should not be compressed */
+	TupleDescAttr(tupdesc, 0)->attcompression = InvalidCompressionMethod;
+	TupleDescAttr(tupdesc, 1)->attcompression = InvalidCompressionMethod;
+
+	namespaceid = rel->rd_rel->relnamespace;
+
+	/* Toast table is shared if and only if its parent is. */
+	shared_relation = rel->rd_rel->relisshared;
+
+	/* It's mapped if and only if its parent is, too */
+	mapped_relation = RelationIsMapped(rel);
+
+	itime_relid = heap_create_with_catalog(itime_relname,
+										   namespaceid,
+										   rel->rd_rel->reltablespace,
+										   InvalidOid,
+										   InvalidOid,
+										   InvalidOid,
+										   rel->rd_rel->relowner,
+										   HEAP_TABLE_AM_OID,
+										   tupdesc,
+										   NIL,
+										   RELKIND_RELATION,
+										   rel->rd_rel->relpersistence,
+										   shared_relation,
+										   mapped_relation,
+										   ONCOMMIT_NOOP,
+										   0,
+										   false,
+										   true,
+										   true,
+										   InvalidOid,
+										   NULL);
+	Assert(itime_relid != InvalidOid);
+
+	/* make the toast relation visible, else table_open will fail */
+	CommandCounterIncrement();
+
+	/* ShareLock is not really needed here, but take it anyway */
+	itime_rel = table_open(itime_relid, ShareLock);
+
+	/*
+	 * Create unique index on itime
+	 */
+
+	indexInfo = makeNode(IndexInfo);
+	indexInfo->ii_NumIndexAttrs = 1;
+	indexInfo->ii_NumIndexKeyAttrs = 1;
+	indexInfo->ii_IndexAttrNumbers[0] = Anum_pg_itime_xxx_itime;
+	indexInfo->ii_Expressions = NIL;
+	indexInfo->ii_ExpressionsState = NIL;
+	indexInfo->ii_Predicate = NIL;
+	indexInfo->ii_PredicateState = NULL;
+	indexInfo->ii_ExclusionOps = NULL;
+	indexInfo->ii_ExclusionProcs = NULL;
+	indexInfo->ii_ExclusionStrats = NULL;
+	indexInfo->ii_OpclassOptions = NULL;
+	indexInfo->ii_Unique = true;
+	indexInfo->ii_NullsNotDistinct = false;
+	indexInfo->ii_ReadyForInserts = true;
+	indexInfo->ii_CheckedUnchanged = false;
+	indexInfo->ii_IndexUnchanged = false;
+	indexInfo->ii_Concurrent = false;
+	indexInfo->ii_BrokenHotChain = false;
+	indexInfo->ii_ParallelWorkers = 0;
+	indexInfo->ii_Am = BTREE_AM_OID;
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
+
+	collationObjectId[0] = InvalidOid;
+
+	classObjectId[0] = INT8_BTREE_OPS_OID;
+
+	coloptions[0] = 0;
+
+	index_create(itime_rel, itime_idxname_itime, InvalidOid, InvalidOid,
+				 InvalidOid, InvalidOid,
+				 indexInfo,
+				 list_make1(Aname_pg_itime_xxx_itime),
+				 BTREE_AM_OID,
+				 rel->rd_rel->reltablespace,
+				 collationObjectId, classObjectId, coloptions, (Datum) 0,
+				 INDEX_CREATE_IS_PRIMARY, 0, true, true, NULL);
+
+	pfree(indexInfo);
+
+	indexInfo = makeNode(IndexInfo);
+	indexInfo->ii_NumIndexAttrs = 1;
+	indexInfo->ii_NumIndexKeyAttrs = 1;
+	indexInfo->ii_IndexAttrNumbers[0] = Anum_pg_itime_xxx_ctid;
+	indexInfo->ii_Expressions = NIL;
+	indexInfo->ii_ExpressionsState = NIL;
+	indexInfo->ii_Predicate = NIL;
+	indexInfo->ii_PredicateState = NULL;
+	indexInfo->ii_ExclusionOps = NULL;
+	indexInfo->ii_ExclusionProcs = NULL;
+	indexInfo->ii_ExclusionStrats = NULL;
+	indexInfo->ii_OpclassOptions = NULL;
+	indexInfo->ii_Unique = true;
+	indexInfo->ii_NullsNotDistinct = false;
+	indexInfo->ii_ReadyForInserts = true;
+	indexInfo->ii_CheckedUnchanged = false;
+	indexInfo->ii_IndexUnchanged = false;
+	indexInfo->ii_Concurrent = false;
+	indexInfo->ii_BrokenHotChain = false;
+	indexInfo->ii_ParallelWorkers = 0;
+	indexInfo->ii_Am = BTREE_AM_OID;
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
+
+	collationObjectId[0] = InvalidOid;
+
+	classObjectId[0] = INT8_BTREE_OPS_OID;
+
+	coloptions[0] = 0;
+
+	index_create(itime_rel, itime_idxname_ctid, InvalidOid, InvalidOid,
+				 InvalidOid, InvalidOid,
+				 indexInfo,
+				 list_make1(Aname_pg_itime_xxx_ctid),
+				 BTREE_AM_OID,
+				 rel->rd_rel->reltablespace,
+				 collationObjectId, classObjectId, coloptions, (Datum) 0,
+				 INDEX_CREATE_IS_PRIMARY, 0, true, true, NULL);
+
+	table_close(itime_rel, NoLock);
+
+	/*
+	 * Store the toast table's OID in the parent relation's pg_class row
+	 */
+	class_rel = table_open(RelationRelationId, RowExclusiveLock);
+
+	if (!IsBootstrapProcessingMode())
+	{
+		/* normal case, use a transactional update */
+		reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relOid));
+		if (!HeapTupleIsValid(reltup))
+			elog(ERROR, "cache lookup failed for relation %u", relOid);
+
+		((Form_pg_class) GETSTRUCT(reltup))->relitimerelid = itime_relid;
+
+		CatalogTupleUpdate(class_rel, &reltup->t_self, reltup);
+	}
+	else
+	{
+		/* While bootstrapping, we cannot UPDATE, so overwrite in-place */
+
+		ScanKeyData key[1];
+		void	   *state;
+
+		ScanKeyInit(&key[0],
+					Anum_pg_class_oid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relOid));
+		systable_inplace_update_begin(class_rel, ClassOidIndexId, true,
+									  NULL, 1, key, &reltup, &state);
+		if (!HeapTupleIsValid(reltup))
+			elog(ERROR, "cache lookup failed for relation %u", relOid);
+
+		((Form_pg_class) GETSTRUCT(reltup))->relitimerelid = itime_relid;
+
+		systable_inplace_update_finish(state, reltup);
+	}
+
+	heap_freetuple(reltup);
+
+	table_close(class_rel, RowExclusiveLock);
+
+	/*
+	 * Register dependency from the toast table to the main, so that the toast
+	 * table will be deleted if the main is.  Skip this in bootstrap mode.
+	 */
+	if (!IsBootstrapProcessingMode())
+	{
+		baseobject.classId = RelationRelationId;
+		baseobject.objectId = relOid;
+		baseobject.objectSubId = 0;
+		myobject.classId = RelationRelationId;
+		myobject.objectId = itime_relid;
+		myobject.objectSubId = 0;
+
+		recordDependencyOn(&myobject, &baseobject, DEPENDENCY_INTERNAL);
+	}
+
+	/*
+	 * Make changes visible
+	 */
+	CommandCounterIncrement();
 }
 
 /*
