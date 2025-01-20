@@ -3901,6 +3901,7 @@ reindex_relation(Oid relid, int flags, ReindexParams *params)
 {
 	Relation	rel;
 	Oid			toast_relid;
+	Oid			itime_relid;
 	List	   *indexIds;
 	char		persistence;
 	bool		result;
@@ -3931,6 +3932,7 @@ reindex_relation(Oid relid, int flags, ReindexParams *params)
 			 RelationGetRelationName(rel));
 
 	toast_relid = rel->rd_rel->reltoastrelid;
+	itime_relid = rel->rd_rel->relitimerelid;
 
 	/*
 	 * Get the list of index OIDs for this relation.  (We trust to the
@@ -4031,6 +4033,20 @@ reindex_relation(Oid relid, int flags, ReindexParams *params)
 		newparams.options &= ~(REINDEXOPT_MISSING_OK);
 		newparams.tablespaceOid = InvalidOid;
 		result |= reindex_relation(toast_relid, flags, &newparams);
+	}
+	if ((flags & REINDEX_REL_PROCESS_TOAST) && OidIsValid(itime_relid))
+	{
+		/*
+		 * Note that this should fail if the toast relation is missing, so
+		 * reset REINDEXOPT_MISSING_OK.  Even if a new tablespace is set for
+		 * the parent relation, the indexes on its toast table are not moved.
+		 * This rule is enforced by setting tablespaceOid to InvalidOid.
+		 */
+		ReindexParams newparams = *params;
+
+		newparams.options &= ~(REINDEXOPT_MISSING_OK);
+		newparams.tablespaceOid = InvalidOid;
+		result |= reindex_relation(itime_relid, flags, &newparams);
 	}
 
 	return result;

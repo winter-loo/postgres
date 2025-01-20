@@ -3076,6 +3076,7 @@ void
 heap_truncate_one_rel(Relation rel)
 {
 	Oid			toastrelid;
+	Oid			itimerelid;
 
 	/*
 	 * Truncate the relation.  Partitioned tables have no storage, so there is
@@ -3100,6 +3101,16 @@ heap_truncate_one_rel(Relation rel)
 		RelationTruncateIndexes(toastrel);
 		/* keep the lock... */
 		table_close(toastrel, NoLock);
+	}
+	itimerelid = rel->rd_rel->relitimerelid;
+	if (OidIsValid(itimerelid))
+	{
+		Relation	itimerel = table_open(itimerelid, AccessExclusiveLock);
+
+		table_relation_nontransactional_truncate(itimerel);
+		RelationTruncateIndexes(itimerel);
+		/* keep the lock... */
+		table_close(itimerel, NoLock);
 	}
 }
 

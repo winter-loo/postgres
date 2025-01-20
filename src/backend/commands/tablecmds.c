@@ -2031,6 +2031,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 		{
 			Oid			heap_relid;
 			Oid			toast_relid;
+			Oid			itime_relid;
 			ReindexParams reindex_params = {0};
 
 			/*
@@ -2064,6 +2065,16 @@ ExecuteTruncateGuts(List *explicit_rels,
 				RelationSetNewRelfilenumber(toastrel,
 											toastrel->rd_rel->relpersistence);
 				table_close(toastrel, NoLock);
+			}
+			itime_relid = rel->rd_rel->relitimerelid;
+			if (OidIsValid(itime_relid))
+			{
+				Relation	itimerel = relation_open(itime_relid,
+													 AccessExclusiveLock);
+
+				RelationSetNewRelfilenumber(itimerel,
+											itimerel->rd_rel->relpersistence);
+				table_close(itimerel, NoLock);
 			}
 
 			/*
@@ -14266,6 +14277,9 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 		if (tuple_class->reltoastrelid != InvalidOid)
 			ATExecChangeOwner(tuple_class->reltoastrelid, newOwnerId,
 							  true, lockmode);
+		if (tuple_class->relitimerelid != InvalidOid)
+			ATExecChangeOwner(tuple_class->relitimerelid, newOwnerId,
+							  true, lockmode);
 
 		/* If it has dependent sequences, recurse to change them too */
 		change_owner_recurse_to_sequences(relationOid, newOwnerId, lockmode);
@@ -14707,6 +14721,10 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 
 		table_close(toastrel, NoLock);
 	}
+	if (OidIsValid(rel->rd_rel->relitimerelid))
+	{
+		/* TODO: same for pg_itime_xxx table */
+	}
 
 	table_close(pgclass, RowExclusiveLock);
 }
@@ -14720,9 +14738,12 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 {
 	Relation	rel;
 	Oid			reltoastrelid;
+	Oid			relitimerelid;
 	RelFileNumber newrelfilenumber;
 	RelFileLocator newrlocator;
 	List	   *reltoastidxids = NIL;
+	List	   *relitimeidxids = NIL;
+
 	ListCell   *lc;
 
 	/*
@@ -14747,6 +14768,15 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 
 		reltoastidxids = RelationGetIndexList(toastRel);
 		relation_close(toastRel, lockmode);
+	}
+	relitimerelid = rel->rd_rel->relitimerelid;
+	/* Fetch the list of indexes on itime relation if necessary */
+	if (OidIsValid(relitimerelid))
+	{
+		Relation	itimeRel = relation_open(relitimerelid, lockmode);
+
+		relitimeidxids = RelationGetIndexList(itimeRel);
+		relation_close(itimeRel, lockmode);
 	}
 
 	/*
@@ -14795,6 +14825,10 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 	if (OidIsValid(reltoastrelid))
 		ATExecSetTableSpace(reltoastrelid, newTableSpace, lockmode);
 	foreach(lc, reltoastidxids)
+		ATExecSetTableSpace(lfirst_oid(lc), newTableSpace, lockmode);
+	if (OidIsValid(relitimerelid))
+		ATExecSetTableSpace(relitimerelid, newTableSpace, lockmode);
+	foreach(lc, relitimeidxids)
 		ATExecSetTableSpace(lfirst_oid(lc), newTableSpace, lockmode);
 
 	/* Clean up */
