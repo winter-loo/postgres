@@ -722,8 +722,17 @@ other			.
 					unsigned char c = strtoul(yytext + 1, NULL, 8);
 
 					check_escape_warning(yyscanner);
-					addlitchar(c, yyscanner);
-					if (c == '\0' || IS_HIGHBIT_SET(c))
+					if (c == '\0')
+					{
+						/* Use Unicode replacement character (U+FFFD) instead of null */
+						/* tests: select E'abc\0def'; */
+						addlit("\xef\xbf\xbd", 3, yyscanner);
+					}
+					else
+					{
+						addlitchar(c, yyscanner);
+					}
+					if (IS_HIGHBIT_SET(c))
 						yyextra->saw_non_ascii = true;
 				}
 <xe>{xehexesc}  {
